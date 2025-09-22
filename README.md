@@ -5,7 +5,7 @@ This repository reproduces the dissertation results on pre-opening capitalisatio
 
 data/                
 
-upload final dataset (cleaned); Please download the raw dataset follow the URL in the paper's appendix.And follow the script(data_cleaning.ipynb and voa_cleaning.ipynb) to get the final dataset if need repeat the process.
+upload final dataset (cleaned); Please download the raw dataset follow the URL in the paper's appendix.And follow the script(data_cleaning.ipynb and twfe_data_cleaning.ipynb) to get the final dataset if need repeat the process.
 
 notebook/            
 
