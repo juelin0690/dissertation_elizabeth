@@ -14,7 +14,7 @@ This repository reproduces the dissertation results on pre-opening capitalisatio
 └── README.md
 
 Run order by filename:
-01_data_clean.ipynb → 02_descriptive_statistics.ipynb → main_model_twfe.qmd
+01_data_clean.ipynb → 02_descriptive_statistics.ipynb/qmd → 03_main_model_twfe.qmd
 
 2) Software and environments
 
