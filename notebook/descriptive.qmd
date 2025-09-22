@@ -1,0 +1,1974 @@
+---
+title: "descriptive"
+format: html
+editor: visual
+---
+# moran
+```{r}
+# ==== Baseline spatial structure with borough basemap ====
+# ---- chunk: map_grid_means ----------------------------------------------------
+suppressPackageStartupMessages({
+  library(arrow); library(sf); library(dplyr); library(tidyr)
+  library(ggplot2); library(readr); library(here)
+})
+
+# 1) 读数据：平衡样本（只取 2008/2015/2021）
+df_bal <- arrow::read_parquet(
+  here("data/clean/borough_final/voa_panel_with_station_band_balanced_with_switch_boroughfinal_with_walkbands.parquet")
+) |>
+  mutate(
+    avd  = as.integer(avd),
+    ln_rv = as.numeric(ln_rv),
+    onspd_easting  = as.numeric(onspd_easting),
+    onspd_northing = as.numeric(onspd_northing)
+  ) |>
+  filter(avd %in% c(2008L, 2015L, 2021L))
+
+# 2) 读 Borough 边界（27700），并合成城市边界
+bnd_path <- "D:/Elizabeth/data/interim/gla_boroughs_2024_27700.gpkg"
+bnd <- st_read(bnd_path, quiet = TRUE)
+if (is.na(st_crs(bnd)) || st_crs(bnd)$epsg != 27700) bnd <- st_transform(bnd, 27700)
+bnd  <- st_make_valid(bnd)
+city <- st_union(bnd)
+
+# 3) 点 → sf；保留城市边界“相交”（含边界线）点
+pts <- st_as_sf(df_bal, coords = c("onspd_easting","onspd_northing"), crs = 27700, remove = FALSE)
+pts <- pts[st_intersects(pts, city, sparse = FALSE), ]
+
+# 4) 生成 1km 方格，裁剪到城市边界
+grid_poly <- st_make_grid(city, cellsize = 1000, square = TRUE, what = "polygons")
+grid_sf   <- st_sf(cell_id = seq_along(grid_poly), geometry = grid_poly)
+grid_sf   <- st_intersection(grid_sf, city)
+
+# 5) 点分配到方格（相交：含边界点）
+pts <- st_join(pts, grid_sf["cell_id"], join = st_intersects, left = FALSE)
+
+# 6) 年×格 聚合 ln_rv 均值
+g <- pts |>
+  st_drop_geometry() |>
+  group_by(avd, cell_id) |>
+  summarise(n = dplyr::n(), mean_lnrv = mean(ln_rv, na.rm = TRUE), .groups = "drop")
+
+# 7) 与格图层合并，做三年并排地图
+yrs <- sort(unique(g$avd))
+grid_year_sf <- bind_rows(lapply(yrs, function(y){
+  left_join(grid_sf, filter(g, avd == y), by = "cell_id") |> mutate(avd = y)
+}))
+
+
+dir.create(here("outputs/figures"), recursive = TRUE, showWarnings = FALSE)
+
+p_map <- ggplot() +
+  geom_sf(data = grid_year_sf, aes(fill = mean_lnrv), colour = NA) +
+  geom_sf(data = bnd, fill = NA, colour = "grey20", linewidth = 0.25) +
+  facet_wrap(~ avd, nrow = 1) +
+  scale_fill_viridis_c(na.value = "grey95") +
+  labs(fill = "Mean ln(RV)", title = "ln(RV) — 1km grid means (2008, 2015, 2021)") +
+  theme_void(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"),
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(here("outputs/figures/fig_map_lnrv_grid_boroughs.png"),
+       p_map, width = 12, height = 4.5, dpi = 300)
+
+
+# ---------- 5) 全局 Moran’s I（逐年，置换检验 nsim=1999） ----------
+dir.create(here("outputs/tables"), recursive = TRUE, showWarnings = FALSE)
+
+moran_by_year <- function(year) {
+  gy <- filter(g, avd == year)
+  # 只取当年出现的网格
+  sub_grid <- grid_sf[grid_sf$cell_id %in% gy$cell_id, ]
+  # 构邻接（Queen），行标准化；若极少数孤岛存在，zero.policy=TRUE 放行
+  nb  <- poly2nb(sub_grid, queen = TRUE)
+  lw  <- nb2listw(nb, style = "W", zero.policy = TRUE)
+  # 对齐 z 顺序
+  z <- gy$mean_lnrv[match(sub_grid$cell_id, gy$cell_id)]
+  # 置换检验
+  mc <- moran.mc(z, lw, nsim = 1999, zero.policy = TRUE, na.action = na.exclude)
+  data.frame(
+    year = year,
+    I    = as.numeric(mc$statistic),
+    p    = as.numeric(mc$p.value),
+    n_cells = nrow(sub_grid),
+    mean_lnrv = mean(z, na.rm = TRUE),
+    sd_lnrv   = sd(z, na.rm = TRUE)
+  )
+}
+
+tab_moran <- bind_rows(lapply(yrs, moran_by_year))
+readr::write_csv(tab_moran, here("outputs/tables/tab_moran_baseline_with_boroughs.csv"))
+print(tab_moran)
+```
+```{r}
+library(readr); library(dplyr); library(glue); library(here)
+
+tab <- readr::read_csv(here("outputs/tables/tab_moran_baseline_with_boroughs.csv"),
+                       show_col_types = FALSE)
+
+fmtp <- function(p){
+  if (is.na(p)) return("NA")
+  if (p < 0.001) "<0.001" else sprintf("%.3f", p)
+}
+
+# 逐年一句话
+lines <- tab %>%
+  arrange(year) %>%
+  mutate(
+    sig = case_when(
+      is.na(p) ~ "（p不可用）",
+      p < 0.01 ~ "（显著，p<0.01）",
+      p < 0.05 ~ "（显著，p<0.05）",
+      p < 0.10 ~ "（边际显著，p<0.10）",
+      TRUE     ~ "（不显著）"
+    ),
+    I_str = sprintf("%.3f", I),
+    p_str = sapply(p, fmtp),
+    n_str = format(n_cells, big.mark = ",")
+  ) %>%
+  transmute(txt = glue(
+    "{year} 年：Moran’s I = {I_str}, p = {p_str}，网格数 n = {n_str}，{sig}"
+  )) %>% pull(txt)
+
+# 趋势描述
+trend <- {
+  t <- tab %>% arrange(year)
+  if (all(diff(t$I) < 0, na.rm = TRUE)) {
+    "总体呈下降（聚集性减弱）"
+  } else if (all(diff(t$I) > 0, na.rm = TRUE)) {
+    "总体呈上升（聚集性增强）"
+  } else {
+    "不同年份变化不单调（聚集性相对稳定或存在阶段性变化）"
+  }
+}
+
+# 若覆盖差异大，加个注记（阈值可调）
+cover_note <- {
+  r <- range(tab$n_cells, na.rm = TRUE)
+  if (!any(is.na(r)) && (max(r) / max(1, min(r)) >= 1.3)) {
+    "各年有效网格覆盖差异较大，I 的跨年比较需结合地图与公共覆盖敏感性。"
+  } else {
+    NULL
+  }
+}
+
+cat("—— 基线空间结构（1km 网格 ln(rv)）——\n")
+cat(paste0("逐年结果：\n- ", paste(lines, collapse = "\n- "), "\n"))
+cat("跨年趋势：", trend, "。\n", sep = "")
+if (!is.null(cover_note)) cat("注：", cover_note, "\n", sep = "")
+```
+# pprice
+```{r}
+# ==== Grid unit price: sum(RV) / grid area (1km) ====
+suppressPackageStartupMessages({
+  library(arrow); library(sf); library(dplyr); library(tidyr)
+  library(ggplot2); library(here); library(readr)
+})
+
+# 0) 路径
+p_pts  <- here("data/clean/borough_final/voa_panel_with_station_band_balanced_with_switch_boroughfinal_with_walkbands.parquet")
+p_bnd  <- "D:/Elizabeth/data/interim/gla_boroughs_2024_27700.gpkg"
+outfig <- here("outputs/figures/fig_grid_unit_price_km2.png")
+outcsv <- here("outputs/tables/tab_grid_unit_price.csv")
+dir.create(dirname(outfig), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(outcsv), recursive = TRUE, showWarnings = FALSE)
+
+# 1) 点数据：只取 2008/2015/2021，确保类型正确
+df <- arrow::read_parquet(p_pts) |>
+  mutate(
+    avd            = as.integer(avd),
+    rv             = as.numeric(rv),
+    onspd_easting  = as.numeric(onspd_easting),
+    onspd_northing = as.numeric(onspd_northing)
+  ) |>
+  filter(avd %in% c(2008L, 2015L, 2021L),
+         !is.na(rv), !is.na(onspd_easting), !is.na(onspd_northing))
+
+# 2) Borough 边界与城市面（EPSG:27700）
+bnd <- st_read(p_bnd, quiet = TRUE)
+if (is.na(st_crs(bnd)) || st_crs(bnd)$epsg != 27700) bnd <- st_transform(bnd, 27700)
+bnd  <- st_make_valid(bnd)
+city <- st_union(bnd)
+
+# 3) 点 → sf，仅保留在城市范围（边界算入）
+pts <- st_as_sf(df, coords = c("onspd_easting","onspd_northing"), crs = 27700, remove = FALSE)
+pts <- pts[st_intersects(pts, city, sparse = FALSE), ]
+
+# 4) 生成 1km 方格并裁剪；计算每格真实面积（m²）
+grid_poly <- st_make_grid(city, cellsize = 1000, square = TRUE, what = "polygons")
+grid_sf   <- st_sf(cell_id = seq_along(grid_poly), geometry = grid_poly)
+grid_sf   <- st_intersection(grid_sf, city) |> st_make_valid()
+grid_sf$area_m2 <- as.numeric(st_area(grid_sf))
+
+# 5) 点落格（相交，含边界）
+pts <- st_join(pts, grid_sf["cell_id"], join = st_intersects, left = FALSE)
+
+# 6) 年 × 格 聚合：RV 总和、样本量（此时只有三年）
+g <- pts |>
+  st_drop_geometry() |>
+  group_by(avd, cell_id) |>
+  summarise(n = dplyr::n(), sum_rv = sum(rv, na.rm = TRUE), .groups = "drop")
+
+# 7) 合并格面积 → 计算“栅格单价”
+#    用 inner_join 只保留有数据的格，避免后续出现 NA 分面
+grid_year <- inner_join(g,
+                        st_drop_geometry(grid_sf)[, c("cell_id","area_m2")],
+                        by = "cell_id") |>
+  mutate(
+    unit_price_per_m2  = sum_rv / area_m2,
+    unit_price_per_km2 = sum_rv / (area_m2 / 1e6),
+    avd = factor(as.integer(avd),
+                 levels = c(2008L, 2015L, 2021L),
+                 labels = c("2008","2015","2021"))
+  )
+
+# 8) 合回几何（仍用 inner_join，确保没有 NA 年份）
+grid_year_sf <- inner_join(grid_sf, grid_year, by = "cell_id")
+stopifnot(!any(is.na(grid_year_sf$avd)))  # 保证不会出现 NA 分面
+
+# 9) 画图（三年分面）
+p_up <- ggplot(grid_year_sf) +
+  geom_sf(aes(fill = unit_price_per_km2), colour = NA) +
+  geom_sf(data = bnd, fill = NA, colour = "grey20", linewidth = 0.25, inherit.aes = FALSE) +
+  facet_wrap(~ avd, nrow = 1) +
+  scale_fill_viridis_c(
+    na.value = "grey95",
+    labels = scales::label_number(scale_cut = scales::cut_short_scale())
+  ) +
+  labs(
+    title = "Grid unit price = sum(RV) / grid area (1km grids)",
+    subtitle = "Total RV per km² by grid; EPSG:27700",
+    fill = "RV per km²"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+ggsave(outfig, p_up, width = 12, height = 4.5, dpi = 300)
+
+# 10) 导出表
+readr::write_csv(grid_year, outcsv)
+
+```
+
+#kde_lnrv
+```{r}
+# ---- chunk: kde_hotspots_masked ----------------------------------------------
+# ---- chunk: kde_hotspots_masked_with_basefill -------------------------------
+suppressPackageStartupMessages({
+  library(arrow); library(sf); library(dplyr); library(ggplot2); library(here)
+  library(viridisLite)  # 用于取色板
+})
+
+# 1) 读数据：平衡样本（2008/2015/2021）
+df_bal <- arrow::read_parquet(
+  here("data/clean/borough_final/voa_panel_with_station_band_balanced_with_switch_boroughfinal_with_walkbands.parquet")
+) |>
+  mutate(
+    avd            = as.integer(avd),
+    onspd_easting  = as.numeric(onspd_easting),
+    onspd_northing = as.numeric(onspd_northing)
+  ) |>
+  filter(avd %in% c(2008L, 2015L, 2021L))
+
+# 2) Borough 边界与城市面
+bnd <- st_read("D:/Elizabeth/data/interim/gla_boroughs_2024_27700.gpkg", quiet = TRUE)
+if (is.na(st_crs(bnd)) || st_crs(bnd)$epsg != 27700) bnd <- st_transform(bnd, 27700)
+bnd  <- st_make_valid(bnd)
+city <- st_union(bnd)
+
+# 3) 点转 sf，并允许“边界点”
+pts <- st_as_sf(df_bal, coords = c("onspd_easting","onspd_northing"),
+                crs = 27700, remove = FALSE)
+pts <- pts[st_intersects(pts, city, sparse = FALSE), ]
+
+# 4) 计算“外部遮罩”：bbox - city（用于盖住伦敦以外）
+bbox_poly    <- st_as_sfc(st_bbox(city)) |> st_set_crs(27700)
+mask_outside <- st_difference(bbox_poly, st_make_valid(city))
+bb           <- st_bbox(city)
+
+# 5) 颜色：取 viridis 色板第 1 个作为“最低密度”底色
+pal     <- viridis(7)      # 7 级足够，一致于 scale_fill_viridis_d 默认
+low_col <- pal[1]
+
+# 6) 绘图：先铺城市底色，再画 KDE，遮掉外部，最后叠边界
+dir.create(here("outputs/figures"), recursive = TRUE, showWarnings = FALSE)
+
+p_kde <- ggplot(pts) +
+  # 先在城市范围铺最低密度底色，避免 KDE 留洞显示为白
+  geom_sf(data = st_as_sf(city), fill = low_col, colour = NA) +
+  # KDE（标准化密度等级）
+  stat_density_2d_filled(
+    aes(x = onspd_easting, y = onspd_northing, fill = after_stat(level)),
+    contour_var = "ndensity", geom = "polygon"
+  ) +
+  # 遮住伦敦之外
+  geom_sf(data = mask_outside, fill = "grey95", colour = NA) +
+  # 行政区线
+  geom_sf(data = bnd, fill = NA, colour = "grey20", linewidth = 0.25) +
+  # 固定同一视窗
+  coord_sf(crs = 27700,
+           xlim = c(bb["xmin"], bb["xmax"]),
+           ylim = c(bb["ymin"], bb["ymax"]),
+           expand = FALSE) +
+  scale_fill_viridis_d(name = "Density") +
+  facet_wrap(~ avd, nrow = 1) +
+  labs(title = "Kernel Density of Retail Properties (2008, 2015, 2021)") +
+  theme_void(base_size = 12) +
+  theme(
+    panel.background = element_rect(fill = "grey95", colour = NA),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    strip.text = element_text(face = "bold")
+  )
+
+ggsave(here("outputs/figures/fig_kde_all_years_masked.png"),
+       p_kde, width = 12, height = 4.5, dpi = 300)
+
+
+```
+# industry
+```{r}
+# ==== Packages ====
+suppressPackageStartupMessages({
+  library(dplyr); library(arrow); library(readr); library(tidyr); library(fs); library(rlang)
+})
+
+# ==== Paths ====
+in_path <- "data/clean/borough_final/voa_panel_with_station_band_balanced_with_switch_boroughfinal_with_walkbands.parquet"
+out_dir <- "outputs/tables"; fs::dir_create(out_dir)
+
+# ==== Read ====
+df <- arrow::read_parquet(in_path)
+
+# ---- detect group column ----
+candidates <- c("group", "scat_grp", "scat_group")
+hits <- candidates[candidates %in% names(df)]
+if (length(hits) == 0) stop("未找到分组列（尝试: group/scat_grp/scat_group）")
+grp_col <- hits[[1]]
+message("使用分组列：", grp_col)
+
+# ---- prep ----
+df1 <- df %>%
+  mutate(
+    avd = as.integer(avd),
+    walk_0_100    = as.integer(walk_0_100    > 0),
+    walk_100_400  = as.integer(walk_100_400  > 0),
+    walk_400_800  = as.integer(walk_400_800  > 0),
+    ring = case_when(
+      walk_0_100   == 1 ~ "0–100m",
+      walk_100_400 == 1 ~ "100–400m",
+      walk_400_800 == 1 ~ "400–800m",
+      TRUE               ~ "800m+"
+    ),
+    ring = factor(ring, levels = c("0–100m","100–400m","400–800m","800m+")),
+    group_raw = as.character(.data[[grp_col]]) |> trimws(),
+    group_lbl = case_when(
+      group_raw %in% c("097","97") ~ "Food Supermarkets",
+      group_raw %in% c("098","98") ~ "Hypermarkets",
+      TRUE                         ~ group_raw
+    )
+  )
+
+# ---- count & share by year × ring × group ----
+tab_long <- df1 %>%
+  group_by(avd, ring) %>%
+  mutate(ring_total = n()) %>%
+  ungroup() %>%
+  group_by(avd, ring, ring_total, group_lbl) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(share = n / ring_total)
+
+# ---- wide: groups as columns; each group has *_n 和 *_share 两列 ----
+# 为了 CSV 列名稳定，将空格替换为下划线
+tab_long <- tab_long %>% mutate(group_key = gsub("\\s+", "_", group_lbl))
+
+tab_wide <- tab_long %>%
+  select(avd, ring, ring_total, group_key, n, share) %>%
+  pivot_wider(
+    names_from  = group_key,
+    values_from = c(n, share),
+    names_glue  = "{group_key}_{.value}"
+  ) %>%
+  arrange(avd, ring)
+
+# ---- export ----
+out_csv <- file.path(out_dir, "tab_group_by_year_ring_count_share_wide.csv")
+write_csv(tab_wide, out_csv, na = "NA")
+message("Wrote: ", out_csv)
+```
+# borough
+```{r}
+# ---------- 绘图（统一图例 + 新标题） ----------
+# ---------- 样式 ----------
+col_boro  <- "#2F2F2F"
+col_route <- "#7F3FBF"
+col_stn   <- "#EA4335"
+
+# ---------- 绘图（分开图例 + 新标题 + 版权） ----------
+p <- ggplot() +
+  # Borough 边界（线，进 color 图例）
+  geom_sf(data = boros, aes(color = "Borough boundary"),
+          fill = NA, linewidth = 0.4, show.legend = TRUE) +
+  # Elizabeth line 路线（线，进 color 图例）
+  geom_sf(data = route, aes(color = "Elizabeth line (route)"),
+          linewidth = 1.2, show.legend = TRUE) +
+  # 车站（点，只进 shape 图例；颜色直接设定，不参与 color 图例）
+  geom_sf(data = stns, aes(shape = "Elizabeth line (stations)"),
+          color = col_stn, fill = col_stn, size = 2.4, stroke = 0.3, show.legend = TRUE) +
+
+  # ——比例尺（沿用你前面算好的 scalebar_df / 文字）——
+  geom_rect(data = scalebar_df,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
+            color = "black", inherit.aes = FALSE, show.legend = FALSE) +
+  scale_fill_identity() +
+  annotate("text", x = sb_left,          y = sb_bottom + sb_h + 0.01*h, label = "0",     hjust = 0.5, size = 3) +
+  annotate("text", x = sb_left + half_w, y = sb_bottom + sb_h + 0.01*h, label = "5 km",  hjust = 0.5, size = 3) +
+  annotate("text", x = sb_left + sb_w,   y = sb_bottom + sb_h + 0.01*h, label = "10 km", hjust = 0.5, size = 3) +
+
+  # 北箭头
+  annotate("segment",
+           x = na_x, xend = na_x, y = na_y, yend = na_y + na_len,
+           arrow = arrow(length = grid::unit(8, "pt"), type = "closed"),
+           linewidth = 0.8) +
+  annotate("text", x = na_x, y = na_y + na_len + 0.02*h, label = "N",
+           fontface = "bold", size = 5) +
+
+  # ——分开图例：线的颜色图例、点的形状图例——
+  scale_color_manual(
+    name = "Legend",
+    values = c("Borough boundary"      = col_boro,
+               "Elizabeth line (route)" = col_route)
+  ) +
+  scale_shape_manual(
+    name = "Legend",
+    values = c("Elizabeth line (stations)" = 16)
+  ) +
+  guides(
+    color = guide_legend(order = 1, override.aes = list(linewidth = c(0.8, 1.2))),
+    shape = guide_legend(order = 2, override.aes = list(colour = col_stn, fill = col_stn, size = 3))
+  ) +
+
+  coord_sf(xlim = c(bb_all["xmin"], bb_all["xmax"]),
+           ylim = c(bb_all["ymin"], bb_all["ymax"]), expand = FALSE) +
+  ggtitle("Greater London（Elizabeth line）") +
+  labs(
+    caption = paste0(
+      'Borough boundaries © Greater London Authority (GLA), updated 2025 ',
+      'TfL stations & route © Transport for London, released 2025'
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    plot.caption.position = "plot",
+    plot.caption = element_text(hjust = 1, vjust = 1, size = 8, margin = margin(t = 6))
+  )
+
+# ---------- 导出 ----------
+ggsave(out_png, plot = p, width = 12, height = 8, dpi = 300, bg = "white")
+cat("已导出图片：", out_png, "\n", sep = "")
+
+
+```
+
+##dependengt
+```{r}
+# ==== Descriptives for ln_rv ====
+suppressPackageStartupMessages({
+  library(arrow); library(dplyr); library(tidyr)
+  library(ggplot2); library(readr); library(forcats)
+  library(stringr)
+})
+
+# ---- 路径（用正斜杠以避免转义问题）----
+p_in  <- "D:/Elizabeth/data/clean/borough_final/voa_panel_with_station_band_balanced_with_switch_boroughfinal_with_walkbands.parquet"
+outdir <- "D:/Elizabeth/work/outputs/descriptive"
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+
+# ---- 读数据 ----
+df <- arrow::read_parquet(p_in)
+
+# ---- 可选：若存在 balanced_3 列则只保留平衡样本 ----
+if ("balanced_3" %in% names(df)) {
+  df <- df |> filter(balanced_3 == 1)
+}
+
+# ---- 基础清理 ----
+df <- df |>
+  mutate(
+    avd = as.factor(avd),                # 年份因子：2008/2015/2021
+    in_caz = ifelse(is.na(in_caz), 0L, in_caz),
+    in_town_centre = ifelse(is.na(in_town_centre), 0L, in_town_centre)
+  ) |>
+  filter(!is.na(ln_rv))
+
+# ---- 步行环带标签（四选一；若落入多个则标记为 'Multiple'）----
+has_bands <- c("walk_0_100","walk_100_400","walk_400_800","beyond_800") %in% names(df)
+if (all(has_bands)) {
+  df <- df |>
+    mutate(
+      band_hits = (walk_0_100 %in% 1) + (walk_100_400 %in% 1) + (walk_400_800 %in% 1) + (beyond_800 %in% 1),
+      band_label = case_when(
+        walk_0_100 == 1 ~ "0–100 m",
+        walk_100_400 == 1 ~ "100–400 m",
+        walk_400_800 == 1 ~ "400–800 m",
+        beyond_800 == 1 ~ ">800 m",
+        band_hits > 1 ~ "Multiple",
+        TRUE ~ "Unassigned"
+      ),
+      band_label = factor(band_label, levels = c("0–100 m","100–400 m","400–800 m",">800 m","Multiple","Unassigned"))
+    )
+} else {
+  warning("未检测到四个 walk_* 环带列，将跳过“按环带对比”的图。")
+}
+
+# ======================
+# 1) 直方图 + 密度（按 avd 分面）
+# ======================
+p_hist <- ggplot(df, aes(x = ln_rv)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40, alpha = 0.6) +
+  geom_density(linewidth = 0.7) +
+  facet_wrap(~ avd, scales = "free_y") +
+  labs(title = "ln(RV): Histogram + Density by AVD", x = "ln(RV)", y = "Density") +
+  theme_minimal(base_size = 12)
+ggsave(file.path(outdir, "hist_density_lnrv_by_avd.png"), p_hist, width = 9, height = 6, dpi = 300)
+
+# ======================
+# 2) QQ 图（检查 log 正态性，按 avd 分面）
+# ======================
+p_qq <- ggplot(df, aes(sample = ln_rv)) +
+  stat_qq(size = 0.8, alpha = 0.5) +
+  stat_qq_line(linewidth = 0.7) +
+  facet_wrap(~ avd) +
+  labs(title = "Normal Q-Q Plot of ln(RV) by AVD", x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal(base_size = 12)
+ggsave(file.path(outdir, "qq_lnrv_by_avd.png"), p_qq, width = 9, height = 6, dpi = 300)
+
+# ======================
+# 3) 按步行环带的箱线图 + 小提琴（按 avd 分面）
+# ======================
+if (all(has_bands)) {
+  p_band <- ggplot(df |> filter(band_label %in% c("0–100 m","100–400 m","400–800 m",">800 m")),
+                   aes(x = band_label, y = ln_rv)) +
+    geom_violin(trim = TRUE, alpha = 0.5) +
+    geom_boxplot(width = 0.2, outlier.alpha = 0.2) +
+    facet_wrap(~ avd, nrow = 1) +
+    labs(title = "ln(RV) by Walking Rings (faceted by AVD)",
+         x = "Walking Ring", y = "ln(RV)") +
+    theme_minimal(base_size = 12)
+  ggsave(file.path(outdir, "violin_box_lnrv_by_ring_by_avd.png"), p_band, width = 10, height = 5.5, dpi = 300)
+}
+
+# ======================
+# 4) CAZ vs 非 CAZ 的箱线图（按 avd 分面）
+# ======================
+p_caz <- ggplot(df, aes(x = factor(in_caz, levels = c(0,1), labels = c("Non-CAZ","CAZ")),
+                        y = ln_rv)) +
+  geom_violin(trim = TRUE, alpha = 0.5) +
+  geom_boxplot(width = 0.2, outlier.alpha = 0.2) +
+  facet_wrap(~ avd, nrow = 1) +
+  labs(title = "ln(RV): CAZ vs Non-CAZ (by AVD)", x = "", y = "ln(RV)") +
+  theme_minimal(base_size = 12)
+ggsave(file.path(outdir, "violin_box_lnrv_caz_by_avd.png"), p_caz, width = 9.5, height = 5.2, dpi = 300)
+
+# ======================
+# 5) Town Centre vs 非 的箱线图（按 avd 分面）
+# ======================
+p_tc <- ggplot(df, aes(x = factor(in_town_centre, levels = c(0,1), labels = c("Non-TownCentre","TownCentre")),
+                       y = ln_rv)) +
+  geom_violin(trim = TRUE, alpha = 0.5) +
+  geom_boxplot(width = 0.2, outlier.alpha = 0.2) +
+  facet_wrap(~ avd, nrow = 1) +
+  labs(title = "ln(RV): Town Centre vs Non (by AVD)", x = "", y = "ln(RV)") +
+  theme_minimal(base_size = 12)
+ggsave(file.path(outdir, "violin_box_lnrv_towncentre_by_avd.png"), p_tc, width = 10, height = 5.2, dpi = 300)
+
+# ======================
+# 6) ECDF 曲线（各年份一条）
+# ======================
+p_ecdf <- ggplot(df, aes(x = ln_rv, color = avd)) +
+  stat_ecdf(linewidth = 0.8) +
+  labs(title = "ECDF of ln(RV) by AVD", x = "ln(RV)", y = "ECDF", color = "AVD") +
+  theme_minimal(base_size = 12)
+ggsave(file.path(outdir, "ecdf_lnrv_by_avd.png"), p_ecdf, width = 9, height = 6, dpi = 300)
+
+# ======================
+# 7) 上下 1% / 5% 截尾阈值表（用于 winsorize 决策）
+# ======================
+qtab <- df |>
+  group_by(avd) |>
+  summarise(
+    n = dplyr::n(),
+    p01 = quantile(ln_rv, 0.01, na.rm = TRUE),
+    p05 = quantile(ln_rv, 0.05, na.rm = TRUE),
+    p95 = quantile(ln_rv, 0.95, na.rm = TRUE),
+    p99 = quantile(ln_rv, 0.99, na.rm = TRUE),
+    mean = mean(ln_rv, na.rm = TRUE),
+    median = median(ln_rv, na.rm = TRUE),
+    sd = sd(ln_rv, na.rm = TRUE)
+  ) |>
+  arrange(avd)
+
+# 保存 CSV
+readr::write_csv(qtab, file.path(outdir, "winsor_thresholds_lnrv_by_avd.csv"))
+
+# 若想同时保存一张示意图（阈值线可视化）
+p_thresh <- df |>
+  group_by(avd) |>
+  mutate(
+    p01 = quantile(ln_rv, 0.01, na.rm = TRUE),
+    p05 = quantile(ln_rv, 0.05, na.rm = TRUE),
+    p95 = quantile(ln_rv, 0.95, na.rm = TRUE),
+    p99 = quantile(ln_rv, 0.99, na.rm = TRUE)
+  ) |>
+  ungroup() |>
+  ggplot(aes(x = ln_rv)) +
+  geom_density() +
+  geom_vline(aes(xintercept = p01, color = "p01"), linewidth = 0.6) +
+  geom_vline(aes(xintercept = p05, color = "p05"), linewidth = 0.6) +
+  geom_vline(aes(xintercept = p95, color = "p95"), linewidth = 0.6) +
+  geom_vline(aes(xintercept = p99, color = "p99"), linewidth = 0.6) +
+  facet_wrap(~ avd, scales = "free_y") +
+  scale_color_manual(values = c("p01" = "#1b9e77","p05" = "#d95f02","p95" = "#7570b3","p99" = "#e7298a"),
+                     name = "Threshold") +
+  labs(title = "Winsor thresholds on ln(RV) by AVD",
+       x = "ln(RV)", y = "Density") +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(outdir, "winsor_thresholds_lnrv_by_avd.png"), p_thresh, width = 10, height = 6, dpi = 300)
+
+message("完成。输出目录：", outdir)
+```
+#ring
+```{r}
+# ==== Elizabeth line: walking vs Euclidean rings (side-by-side, clipped) ====
+suppressPackageStartupMessages({
+  library(sf); library(dplyr); library(ggplot2)
+})
+
+# -- Paths --
+p_walk   <- "D:/Elizabeth/data/interim/net_band/output_realistic_walking/elizabeth_all_realistic_rings.gpkg"
+p_euclid <- "D:/Elizabeth/data/clean/elizabeth_station_rings_27700.gpkg"
+p_boro   <- "D:/Elizabeth/data/interim/gla_boroughs_2024_27700.gpkg"
+p_route  <- "D:/Elizabeth/data/interim/tfl_elizabeth_line_route_2022_27700.gpkg"
+p_stns   <- "D:/Elizabeth/data/interim/tfl_elizabeth_line_stations_2022_27700.gpkg"
+
+outdir <- "D:/Elizabeth/work/outputs/descriptive"
+outfile_png <- file.path(outdir, "elizabeth_rings_side_by_side_simple.png")
+outfile_pdf <- file.path(outdir, "elizabeth_rings_side_by_side_simple.pdf")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# -- Helpers --
+to27700 <- function(g) {
+  if (is.na(st_crs(g)) || st_crs(g)$epsg != 27700) g <- st_transform(g, 27700)
+  st_make_valid(g)
+}
+keep_and_clip_to <- function(x, clip_poly) {
+  x <- x[lengths(st_intersects(x, clip_poly)) > 0, ]
+  st_intersection(x, clip_poly)
+}
+
+# -- Read & CRS --
+bnd   <- to27700(st_read(p_boro,  quiet = TRUE))
+route <- to27700(st_read(p_route, quiet = TRUE))
+stns  <- to27700(st_read(p_stns,  quiet = TRUE))
+walk0 <- to27700(st_read(p_walk,  quiet = TRUE))
+euc0  <- to27700(st_read(p_euclid,quiet = TRUE))
+
+# -- City polygon & clip all layers to London --
+city  <- st_union(bnd)
+walk  <- keep_and_clip_to(walk0, city)
+euc   <- keep_and_clip_to(euc0,  city)
+route <- keep_and_clip_to(route, city)
+stns  <- keep_and_clip_to(stns,  city)
+
+# -- Tag panel type & combine (do NOT name geometry explicitly) --
+walk$type <- factor("Walking rings",  levels = c("Walking rings","Euclidean rings"))
+euc$type  <- factor("Euclidean rings", levels = c("Walking rings","Euclidean rings"))
+walk_plot <- dplyr::select(walk, type)  # geometry auto-kept
+euc_plot  <- dplyr::select(euc,  type)  # geometry auto-kept
+rings_all <- dplyr::bind_rows(walk_plot, euc_plot)
+
+# -- Plot (side-by-side) --
+bb <- st_bbox(city)
+p <- ggplot() +
+  geom_sf(data = bnd,   fill = NA,  colour = "grey30", linewidth = 0.25) +
+  geom_sf(data = rings_all, aes(fill = type), alpha = 0.55, colour = NA) +
+  geom_sf(data = route, colour = "black", linewidth = 0.6) +
+  geom_sf(data = stns,  colour = "black", fill = "white", shape = 21, size = 1.8, stroke = 0.3) +
+  coord_sf(crs = 27700,
+           xlim = c(bb["xmin"], bb["xmax"]),
+           ylim = c(bb["ymin"], bb["ymax"]),
+           expand = FALSE) +
+  facet_wrap(~ type, nrow = 1) +
+  scale_fill_manual(values = c("Walking rings" = "#2C7FB8",
+                               "Euclidean rings" = "#FDB366"),
+                    name = NULL) +
+  labs(title = "Elizabeth line coverage: Walking vs Euclidean rings") +
+  theme_void(base_size = 12) +
+  theme(
+    strip.text  = element_text(face = "bold"),
+    plot.title  = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+
+# 如需静音 geom_sf 的“attribute variables …”提示，可用 suppressWarnings() 包裹 ggsave：
+suppressWarnings( ggsave(outfile_png, p, width = 13, height = 7.5, dpi = 300) )
+suppressWarnings( ggsave(outfile_pdf, p, width = 13, height = 7.5) )
+
+```
+```{r}
+suppressPackageStartupMessages(library(arrow))
+
+# 路径（把 \ 改成 / ）
+p <- "D:/Elizabeth/data/clean/borough_final/voa_panel_with_station_band_with_switch_boroughfinal_with_walkbands.parquet"
+stopifnot(file.exists(p))
+
+# 读入为 Arrow Table（更快拿列名）
+tab  <- arrow::read_parquet(p, as_data_frame = FALSE)
+cols <- names(tab)
+
+# 直接打印
+print(cols)
+
+# 带编号打印
+cat("\n--- Columns ---\n")
+cat(sprintf("%02d. %s\n", seq_along(cols), cols), sep = "")
+```
+#panel
+```{r}
+# ==== Packages ====
+suppressPackageStartupMessages({
+  library(arrow); library(dplyr); library(tidyr); library(readr)
+})
+
+# ==== 路径 ====
+p_in  <- "D:/Elizabeth/data/clean/borough_final/voa_panel_with_station_band_with_switch_boroughfinal_with_walkbands.parquet"
+p_out <- "D:/Elizabeth/work/outputs/descriptive"
+if (!dir.exists(p_out)) dir.create(p_out, recursive = TRUE)
+
+# ==== 读数据 ====
+df <- read_parquet(p_in)
+
+# 兼容 beyond 列名
+if (!("walk_beyond_800" %in% names(df)) && ("beyond_800" %in% names(df))) {
+  df$walk_beyond_800 <- df$beyond_800
+}
+
+# 标准化列 & 分组（注意：unbalanced 包含 balanced）
+to_logical <- function(x) { as.logical(as.integer(x)) }
+df <- df |>
+  mutate(
+    walk_0_100       = to_logical(walk_0_100),
+    walk_100_400     = to_logical(walk_100_400),
+    walk_400_800     = to_logical(walk_400_800),
+    walk_beyond_800  = to_logical(walk_beyond_800),
+    balanced   = n_t == 3,
+    unbalanced = n_t >= 2
+  )
+
+# ========= Tab1 =========
+# 源数据每年唯一 uarn（n_obs）
+n_obs_by_year <- df |>
+  group_by(avd) |>
+  summarise(n_obs = n_distinct(uarn), .groups = "drop")
+
+# 组内每年唯一 uarn（n_uarn）
+tab1_bal <- df |>
+  filter(balanced) |>
+  group_by(avd) |>
+  summarise(n_uarn = n_distinct(uarn), .groups = "drop") |>
+  mutate(group = "balanced")
+
+tab1_unbal <- df |>
+  filter(unbalanced) |>
+  group_by(avd) |>
+  summarise(n_uarn = n_distinct(uarn), .groups = "drop") |>
+  mutate(group = "unbalanced")
+
+# 组内全期唯一 uarn 总数 + 相对源数据全期唯一 uarn 总数的比例
+total_uarn_all <- n_distinct(df$uarn)
+
+group_totals <- bind_rows(
+  tibble(group = "balanced",
+         group_total_uarn = n_distinct(df$uarn[df$balanced])),
+  tibble(group = "unbalanced",
+         group_total_uarn = n_distinct(df$uarn[df$unbalanced]))
+) |>
+  mutate(group_total_uarn_share = group_total_uarn / total_uarn_all)
+
+# 合成 Tab1
+tab1 <- bind_rows(tab1_bal, tab1_unbal) |>
+  left_join(n_obs_by_year, by = "avd") |>
+  mutate(share_of_n_obs = n_uarn / n_obs) |>
+  left_join(group_totals, by = "group") |>
+  arrange(factor(group, levels = c("balanced","unbalanced")), avd)
+
+write_csv(tab1, file.path(p_out, "tab1_year_group_uarn.csv"))
+
+# ========= Tab2（两个表）=========
+# 长表：年×uarn×环带
+rings_long <- df |>
+  select(avd, uarn, balanced, unbalanced,
+         walk_0_100, walk_100_400, walk_400_800, walk_beyond_800) |>
+  pivot_longer(
+    cols = starts_with("walk_"),
+    names_to = "ring",
+    values_to = "in_ring"
+  ) |>
+  mutate(
+    ring = factor(ring,
+                  levels = c("walk_0_100","walk_100_400","walk_400_800","walk_beyond_800"),
+                  labels = c("0-100","100-400","400-800",">800"))
+  )
+
+# 一个函数：生成（某组）宽表：列为 ring_n / ring_share
+make_tab2 <- function(data, group_flag = c("balanced","unbalanced")) {
+  group_flag <- match.arg(group_flag)
+  filt <- if (group_flag == "balanced") data$balanced else data$unbalanced
+
+  # 分母：该组该年的唯一 uarn
+  denom <- data |>
+    filter(filt) |>
+    group_by(avd) |>
+    summarise(N_uarn_group_year = n_distinct(uarn), .groups = "drop")
+
+  # 计数：该组该年×环带内唯一 uarn
+  counts <- data |>
+    filter(filt, in_ring) |>
+    group_by(avd, ring) |>
+    summarise(n_uarn = n_distinct(uarn), .groups = "drop") |>
+    left_join(denom, by = "avd") |>
+    mutate(share = ifelse(N_uarn_group_year > 0, n_uarn / N_uarn_group_year, NA_real_))
+
+  # 宽表：0-100_n, 0-100_share, ...
+  out <- counts |>
+    mutate(metric_n = paste0(ring, "_n"),
+           metric_s = paste0(ring, "_share")) |>
+    select(avd, ring, n_uarn, share, metric_n, metric_s) |>
+    pivot_longer(cols = c(n_uarn, share),
+                 names_to = "type", values_to = "value") |>
+    mutate(colname = ifelse(type == "n_uarn", metric_n, metric_s)) |>
+    select(avd, colname, value) |>
+    pivot_wider(names_from = colname, values_from = value) |>
+    arrange(avd)
+
+  # 缺失补 0（计数）/ NA（占比保持 NA 更合理）
+  count_cols  <- grep("_n$", names(out), value = TRUE)
+  share_cols  <- grep("_share$", names(out), value = TRUE)
+  out[count_cols][is.na(out[count_cols])] <- 0
+  # share 留 NA
+
+  return(out)
+}
+
+tab2_balanced    <- make_tab2(rings_long, "balanced")
+tab2_unbalanced  <- make_tab2(rings_long, "unbalanced")
+
+write_csv(tab2_balanced,   file.path(p_out, "tab2_year_ring_balanced_wide.csv"))
+write_csv(tab2_unbalanced, file.path(p_out, "tab2_year_ring_unbalanced_wide.csv"))
+
+# 可选：看看头部
+print(tab1)
+print(head(tab2_balanced))
+print(head(tab2_unbalanced))
+
+```
+
+# forest
+```{r}
+# ===== Robustness forest + Euclidean spline (UPDATED) =====
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(stringr); library(forcats); library(ggplot2); library(purrr)
+})
+
+# --- 路径 ---
+tab_dir <- "D:/Elizabeth/outputs/tables"
+fig_dir <- "D:/Elizabeth/outputs/figures"
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+# --- 规格与文件（存在才读）---
+files_map <- tibble::tribble(
+  ~fname,                                 ~spec,                    ~reader,
+  "tab_main_twfe.csv",                    "Main spec (Table 3)",    "main_twfe",
+  "tab_donut_twfe.csv",                   "Donut rings (TWFE)",     "term",
+  "tab_euclid_twfe.csv",                  "Euclidean rings (TWFE)", "term",
+  "tab_main_boro_year.csv",               "Borough×Year FE",        "fe",
+  "tab_main_grid1k_year.csv",             "1km Grid×Year FE",       "fe",
+  "tab_unbalanced_twfe.csv",              "Unbalanced panel",       "term",
+  "tab_main_winsor1_twfe.csv",            "Winsor 1%",              "term",
+  "tab_main_winsor2_twfe.csv",            "Winsor 2%",              "term",
+  "se_compare_conley2km.csv",             "Conley 2km (TWFE)",      "conley",
+  "main_pureprice/tab_main_pureprice.csv","Pure price sample",      "pureprice"
+)
+
+# --- 小工具 ---
+pretty_ring <- function(x) {
+  x <- tolower(as.character(x))
+  dplyr::case_when(
+    str_detect(x, "walk_0_100|euc_0_100|euclid_0_100|e0_100|0–?100 ?m") ~ "0–100 m",
+    str_detect(x, "walk_100_400|euc_100_400|euclid_100_400|e100_400|100–?400 ?m") ~ "100–400 m",
+    str_detect(x, "walk_400_800|euc_400_800|euclid_400_800|e400_800|400–?800 ?m") ~ "400–800 m",
+    TRUE ~ NA_character_
+  )
+}
+
+# 从 term 解析 year（2015/2021）
+parse_year_from_term <- function(term) {
+  y <- stringr::str_extract(as.character(term), "(2015|2021)")
+  ifelse(is.na(y), NA_character_, y)
+}
+
+# --- 各类读取器 ---
+read_term_tbl <- function(path, spec_label) {
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  term <- df[[ dplyr::coalesce(names(df)[nm=="term"], names(df)[1]) ]]
+  beta <- df[[ dplyr::coalesce(names(df)[nm %in% c("beta","estimate")]) ]]
+  se   <- df[[ dplyr::coalesce(names(df)[nm %in% c("se","std.error")]) ]]
+  p    <- df[[ dplyr::coalesce(names(df)[nm %in% c("p","p.value")]) ]]
+  lo   <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_lo","ci.low","conf.low")]) ]]
+  hi   <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_hi","ci.high","conf.high")]) ]]
+
+  tibble(term = as.character(term),
+         estimate = as.numeric(beta),
+         se = as.numeric(se),
+         p = as.numeric(p),
+         ci_lo = suppressWarnings(as.numeric(lo)),
+         ci_hi = suppressWarnings(as.numeric(hi))) |>
+    mutate(
+      ring = pretty_ring(term),
+      year = parse_year_from_term(term),
+      ci_lo = coalesce(ci_lo, estimate - 1.96*se),
+      ci_hi = coalesce(ci_hi, estimate + 1.96*se),
+      spec  = spec_label
+    ) |>
+    filter(!is.na(ring), year %in% c("2015","2021")) |>
+    select(spec, year, ring, term, estimate, se, p, ci_lo, ci_hi)
+}
+
+read_fe_tbl <- function(path, spec_label) {
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  ring_raw <- df[[ dplyr::coalesce(names(df)[nm=="ring"], names(df)[1]) ]]
+  year     <- df[[ dplyr::coalesce(names(df)[nm=="year"]) ]]
+  beta     <- df[[ dplyr::coalesce(names(df)[nm %in% c("beta","estimate")]) ]]
+  se       <- df[[ dplyr::coalesce(names(df)[nm %in% c("se","std.error")]) ]]
+  p        <- df[[ dplyr::coalesce(names(df)[nm %in% c("p","p.value")]) ]]
+  lo       <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_lo","ci.low","conf.low")]) ]]
+  hi       <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_hi","ci.high","conf.high")]) ]]
+  term_col <- df[[ dplyr::coalesce(names(df)[nm %in% c("coef_name","term")], names(df)[1]) ]]
+
+  tibble(
+    ring = pretty_ring(ring_raw),
+    year = as.character(year),
+    term = as.character(term_col),
+    estimate = as.numeric(beta),
+    se = as.numeric(se),
+    p  = as.numeric(p),
+    ci_lo = suppressWarnings(as.numeric(lo)),
+    ci_hi = suppressWarnings(as.numeric(hi))
+  ) |>
+    mutate(
+      ci_lo = coalesce(ci_lo, estimate - 1.96*se),
+      ci_hi = coalesce(ci_hi, estimate + 1.96*se),
+      spec  = spec_label
+    ) |>
+    filter(!is.na(ring), year %in% c("2015","2021")) |>
+    select(spec, year, ring, term, estimate, se, p, ci_lo, ci_hi)
+}
+
+# 主规格（表三），已有标准列：ring, year, beta, se, ci_low, ci_high, p
+read_main_twfe <- function(path, spec_label) {
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  df |>
+    transmute(
+      spec = spec_label,
+      year = as.character(year),
+      ring = pretty_ring(ring),
+      term = paste0("main:", ring, ":", year),
+      estimate = as.numeric(beta),
+      se = as.numeric(se),
+      p  = as.numeric(p),
+      ci_lo = as.numeric(coalesce(ci_low, beta - 1.96*se)),
+      ci_hi = as.numeric(coalesce(ci_high, beta + 1.96*se))
+    ) |>
+    filter(!is.na(ring), year %in% c("2015","2021"))
+}
+
+# Conley 对比表：term, beta, se_b, se_c, p_b, p_c（取 Conley 列）
+read_conley <- function(path, spec_label) {
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  stopifnot(all(c("term","beta","se_c","p_c") %in% names(df)))
+  tibble(
+    term = as.character(df$term),
+    estimate = as.numeric(df$beta),
+    se = as.numeric(df$se_c),
+    p  = as.numeric(df$p_c),
+    ci_lo = as.numeric(df$beta) - 1.96*as.numeric(df$se_c),
+    ci_hi = as.numeric(df$beta) + 1.96*as.numeric(df$se_c),
+    ring = pretty_ring(df$term),
+    year = parse_year_from_term(df$term),
+    spec = spec_label
+  ) |>
+    filter(!is.na(ring), year %in% c("2015","2021")) |>
+    select(spec, year, ring, term, estimate, se, p, ci_lo, ci_hi)
+}
+
+# 纯价格样本：year, ring, coef(se), 可能还有百分比列
+read_pureprice <- function(path, spec_label) {
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  tibble(
+    year = as.character(df[[ dplyr::coalesce(names(df)[nm=="year"]) ]]),
+    ring = pretty_ring(df[[ dplyr::coalesce(names(df)[nm=="ring"]) ]]),
+    estimate = as.numeric(df[[ dplyr::coalesce(names(df)[nm %in% c("coef","beta","estimate")]) ]]),
+    se = as.numeric(df[[ dplyr::coalesce(names(df)[nm %in% c("se","std.error")]) ]])
+  ) |>
+    mutate(
+      term = paste0("pureprice:", ring, ":", year),
+      p = NA_real_,
+      ci_lo = estimate - 1.96*se,
+      ci_hi = estimate + 1.96*se,
+      spec = spec_label
+    ) |>
+    filter(!is.na(ring), year %in% c("2015","2021")) |>
+    select(spec, year, ring, term, estimate, se, p, ci_lo, ci_hi)
+}
+
+# 分发器
+read_dispatch <- function(full, spec, reader) {
+  if (!file.exists(full)) return(NULL)
+  switch(reader,
+         "term"      = read_term_tbl(full, spec),
+         "fe"        = read_fe_tbl(full, spec),
+         "main_twfe" = read_main_twfe(full, spec),
+         "conley"    = read_conley(full, spec),
+         "pureprice" = read_pureprice(full, spec),
+         NULL)
+}
+
+# 读取 + 合并
+rob_list <- files_map |>
+  mutate(full = file.path(tab_dir, fname)) |>
+  mutate(tbl = map2(full, spec, ~ read_dispatch(.x, .y, files_map$reader[files_map$spec==.y]))) |>
+  pull(tbl)
+
+robust_all <- bind_rows(rob_list) |>
+  filter(ring %in% c("0–100 m","100–400 m","400–800 m"),
+         year %in% c("2015","2021")) |>
+  mutate(
+    ring = factor(ring, levels = c("0–100 m","100–400 m","400–800 m")),
+    year = factor(year, levels = c("2015","2021")),
+    spec = factor(spec, levels = c(
+      "Main spec (Table 3)",
+      "Donut rings (TWFE)", "Euclidean rings (TWFE)", "Conley 2km (TWFE)",
+      "Borough×Year FE", "1km Grid×Year FE",
+      "Winsor 1%", "Winsor 2%",
+      "Pure price sample", "Unbalanced panel"
+    ))
+  ) |>
+  arrange(ring, year, spec)
+
+# 保存合并长表
+out_csv <- file.path(tab_dir, "robustness_rings_by_year_FULL.csv")
+write_csv(robust_all, out_csv)
+message("Saved merged table: ", out_csv)
+
+# --- 跨规格森林图（2015 / 2021 各一张）---
+plot_forest_by_year <- function(dat, yr, out_path) {
+  dd <- dat |> filter(year == yr) |>
+    mutate(y_lab = paste0(as.character(spec), " | ", as.character(ring))) |>
+    arrange(ring, spec) |>
+    mutate(y_lab = factor(y_lab, levels = rev(unique(y_lab))))
+  if (nrow(dd) == 0) return(invisible(NULL))
+
+  g <- ggplot(dd, aes(x = estimate, y = y_lab)) +
+    geom_errorbarh(aes(xmin = ci_lo, xmax = ci_hi), height = 0) +
+    geom_point() +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(x = "Coefficient on ring (log RV)", y = NULL,
+         title = paste0("Robustness checks (", yr, "): ring coefficients across specifications"),
+         subtitle = "95% CI; borough-clustered / Conley (as labeled)") +
+    theme_minimal(base_size = 12)
+
+  ggsave(out_path, g, width = 8, height = max(4, 0.38*nrow(dd)), dpi = 300)
+  message("Saved forest: ", out_path)
+}
+
+plot_forest_by_year(robust_all, "2015", file.path(fig_dir, "robustness_forest_2015.png"))
+plot_forest_by_year(robust_all, "2021", file.path(fig_dir, "robustness_forest_2021.png"))
+
+# --- 欧式样条平滑效应（相对 1600 m）---
+spline_path <- file.path(tab_dir, "tab_spline_effects_vs1600_borough.csv")
+if (file.exists(spline_path)) {
+  sp <- suppressMessages(read_csv(spline_path, show_col_types = FALSE)) |>
+    mutate(year = factor(year)) |>
+    arrange(year, dist_m)
+
+  g_sp <- ggplot(sp, aes(x = dist_m, y = beta, group = year, color = year)) +
+    geom_line() +
+    geom_point() +
+    geom_linerange(aes(ymin = ci_lo, ymax = ci_hi)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(x = "Euclidean distance to nearest EL station (m)",
+         y = "Effect vs 1,600 m (log RV)",
+         title = "Spline-based distance effect",
+         subtitle = "Relative to 1,600 m baseline") +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "top")
+
+  ggsave(file.path(fig_dir, "robustness_spline_curve.png"), g_sp, width = 7.2, height = 4.6, dpi = 300)
+  message("Saved spline: ", file.path(fig_dir, "robustness_spline_curve.png"))
+} else {
+  message("Spline file not found: ", spline_path)
+}
+
+```
+
+#robust&sensitivity
+
+```{r}
+# ===== Robustness Sets (ring-first ordering) =====
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(stringr); library(ggplot2)
+  library(purrr); library(forcats); library(tibble)
+})
+
+# --- Paths ---
+tab_dir <- "D:/Elizabeth/outputs/tables"
+fig_dir <- "D:/Elizabeth/outputs/figures"
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+# --- Helpers ---
+pretty_ring <- function(x){
+  x <- tolower(as.character(x))
+  dplyr::case_when(
+    str_detect(x, "walk_0_100|euc_0_100|euclid_0_100|e0_100|0–?100 ?m") ~ "0–100 m",
+    str_detect(x, "walk_100_400|euc_100_400|euclid_100_400|e100_400|100–?400 ?m") ~ "100–400 m",
+    str_detect(x, "walk_400_800|euc_400_800|euclid_400_800|e400_800|400–?800 ?m") ~ "400–800 m",
+    TRUE ~ NA_character_
+  )
+}
+parse_year_from_term <- function(term){
+  y <- stringr::str_extract(as.character(term), "(2015|2021)")
+  ifelse(is.na(y), NA_character_, y)
+}
+
+read_term_tbl <- function(path, spec_label){
+  df <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  term <- df[[ dplyr::coalesce(names(df)[nm=="term"], names(df)[1]) ]]
+  beta <- df[[ dplyr::coalesce(names(df)[nm %in% c("beta","estimate")]) ]]
+  se   <- df[[ dplyr::coalesce(names(df)[nm %in% c("se","std.error")]) ]]
+  p    <- df[[ dplyr::coalesce(names(df)[nm %in% c("p","p.value")]) ]]
+  lo   <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_lo","ci.low","conf.low")]) ]]
+  hi   <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_hi","ci.high","conf.high")]) ]]
+  tibble(term = as.character(term),
+         estimate = as.numeric(beta),
+         se = as.numeric(se),
+         p = as.numeric(p),
+         ci_lo = suppressWarnings(as.numeric(lo)),
+         ci_hi = suppressWarnings(as.numeric(hi))) |>
+    mutate(
+      ring = pretty_ring(term),
+      year = parse_year_from_term(term),
+      ci_lo = dplyr::coalesce(ci_lo, estimate - 1.96*se),
+      ci_hi = dplyr::coalesce(ci_hi, estimate + 1.96*se),
+      spec  = spec_label
+    ) |>
+    dplyr::filter(!is.na(ring), year %in% c("2015","2021")) |>
+    dplyr::select(spec, year, ring, term, estimate, se, p, ci_lo, ci_hi)
+}
+
+read_fe_tbl <- function(path, spec_label){
+  df <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  ring_raw <- df[[ dplyr::coalesce(names(df)[nm=="ring"], names(df)[1]) ]]
+  year     <- df[[ dplyr::coalesce(names(df)[nm=="year"]) ]]
+  beta     <- df[[ dplyr::coalesce(names(df)[nm %in% c("beta","estimate")]) ]]
+  se       <- df[[ dplyr::coalesce(names(df)[nm %in% c("se","std.error")]) ]]
+  p        <- df[[ dplyr::coalesce(names(df)[nm %in% c("p","p.value")]) ]]
+  lo       <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_lo","ci.low","conf.low")]) ]]
+  hi       <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_hi","ci.high","conf.high")]) ]]
+  term_col <- df[[ dplyr::coalesce(names(df)[nm %in% c("coef_name","term")], names(df)[1]) ]]
+  tibble(
+    ring = pretty_ring(ring_raw),
+    year = as.character(year),
+    term = as.character(term_col),
+    estimate = as.numeric(beta),
+    se = as.numeric(se),
+    p  = as.numeric(p),
+    ci_lo = suppressWarnings(as.numeric(lo)),
+    ci_hi = suppressWarnings(as.numeric(hi))
+  ) |>
+    mutate(
+      ci_lo = dplyr::coalesce(ci_lo, estimate - 1.96*se),
+      ci_hi = dplyr::coalesce(ci_hi, estimate + 1.96*se),
+      spec  = spec_label
+    ) |>
+    dplyr::filter(!is.na(ring), year %in% c("2015","2021")) |>
+    dplyr::select(spec, year, ring, term, estimate, se, p, ci_lo, ci_hi)
+}
+
+read_main_twfe <- function(path, spec_label){
+  df <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
+  df |>
+    dplyr::transmute(
+      spec = spec_label,
+      year = as.character(year),
+      ring = pretty_ring(ring),
+      term = paste0("main:", ring, ":", year),
+      estimate = as.numeric(beta),
+      se = as.numeric(se),
+      p  = as.numeric(p),
+      ci_lo = as.numeric(dplyr::coalesce(ci_low, beta - 1.96*se)),
+      ci_hi = as.numeric(dplyr::coalesce(ci_high, beta + 1.96*se))
+    ) |>
+    dplyr::filter(!is.na(ring), year %in% c("2015","2021"))
+}
+
+read_conley <- function(path, spec_label){
+  df <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
+  stopifnot(all(c("term","beta","se_c","p_c") %in% names(df)))
+  tibble(
+    term = as.character(df$term),
+    estimate = as.numeric(df$beta),
+    se = as.numeric(df$se_c),
+    p  = as.numeric(df$p_c),
+    ci_lo = as.numeric(df$beta) - 1.96*as.numeric(df$se_c),
+    ci_hi = as.numeric(df$beta) + 1.96*as.numeric(df$se_c),
+    ring = pretty_ring(df$term),
+    year = parse_year_from_term(df$term),
+    spec = spec_label
+  ) |>
+    dplyr::filter(!is.na(ring), year %in% c("2015","2021")) |>
+    dplyr::select(spec, year, ring, term, estimate, se, p, ci_lo, ci_hi)
+}
+
+read_pureprice <- function(path, spec_label){
+  df <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  tibble(
+    year = as.character(df[[ dplyr::coalesce(names(df)[nm=="year"]) ]]),
+    ring = pretty_ring(df[[ dplyr::coalesce(names(df)[nm=="ring"]) ]]),
+    estimate = as.numeric(df[[ dplyr::coalesce(names(df)[nm %in% c("coef","beta","estimate")]) ]]),
+    se = as.numeric(df[[ dplyr::coalesce(names(df)[nm %in% c("se","std.error")]) ]])
+  ) |>
+    mutate(
+      term = paste0("pureprice:", ring, ":", year),
+      p = NA_real_,
+      ci_lo = estimate - 1.96*se,
+      ci_hi = estimate + 1.96*se,
+      spec = spec_label
+    ) |>
+    dplyr::filter(!is.na(ring), year %in% c("2015","2021")) |>
+    dplyr::select(spec, year, ring, term, estimate, se, p, ci_lo, ci_hi)
+}
+
+read_dispatch <- function(full, spec, reader){
+  if (!file.exists(full)) return(NULL)
+  switch(reader,
+         "term"      = read_term_tbl(full, spec),
+         "fe"        = read_fe_tbl(full, spec),
+         "main_twfe" = read_main_twfe(full, spec),
+         "conley"    = read_conley(full, spec),
+         "pureprice" = read_pureprice(full, spec),
+         NULL)
+}
+
+# --- Forest plot (ring-first: 0–100 → 100–400 → 400–800; spec 上到下) ---
+make_forest <- function(dat, yr, out_path){
+  dd <- dat |>
+    dplyr::filter(year == yr) |>
+    dplyr::arrange(ring, spec) |>
+    dplyr::mutate(
+      # 标签建议“环带 | 规格”
+      y_lab = paste0(as.character(spec), " | ", as.character(ring)),
+      # 关键：反转 levels，让第一个（0–100 m 组）在最上方
+      y_lab = factor(y_lab, levels = rev(unique(y_lab)))
+    )
+
+  g <- ggplot(dd, aes(x = estimate, y = y_lab)) +
+    geom_errorbarh(aes(xmin = ci_lo, xmax = ci_hi), height = 0) +
+    geom_point() +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(x = "Coefficient on ring (log RV)", y = NULL,
+         title = paste0("Robustness&Sensitivity (", yr, ")"))
+         theme_minimal(base_size = 12)
+
+  ggsave(out_path, g, width = 8, height = max(4, 0.38*nrow(dd)), dpi = 300)
+}
+
+
+# ===================== SET A =====================
+files_A <- tibble::tribble(
+  ~fname,                     ~spec,                      ~reader,
+  "tab_main_twfe.csv",        "Main spec (TWFE)",      "main_twfe",
+  "tab_euclid_twfe.csv",      "Euclidean rings (TWFE)",   "term",
+  "tab_donut_twfe.csv",       "Donut rings (TWFE)",       "term",
+  "tab_main_boro_year.csv",   "Borough×Year FE",          "fe",
+  "tab_main_grid1k_year.csv", "1km Grid×Year FE",         "fe",
+  "se_compare_conley2km.csv", "Conley 2km (TWFE)",        "conley"
+)
+
+rob_A <- files_A |>
+  mutate(full = file.path(tab_dir, fname),
+         tbl  = map2(full, spec, ~ read_dispatch(.x, .y, files_A$reader[files_A$spec==.y]))) |>
+  pull(tbl) |> purrr::compact() |> dplyr::bind_rows() |>
+  dplyr::filter(ring %in% c("0–100 m","100–400 m","400–800 m"), year %in% c("2015","2021")) |>
+  mutate(
+    ring = factor(ring, levels = c("0–100 m","100–400 m","400–800 m")),
+    year = factor(year, levels = c("2015","2021")),
+    spec = factor(spec, levels = c("Main spec (TWFE)","Euclidean rings (TWFE)",
+                                   "Donut rings (TWFE)","Borough×Year FE",
+                                   "1km Grid×Year FE","Conley 2km (TWFE)"))
+  )
+
+outA_csv <- file.path(tab_dir, "robustness_SET_A_ringfirst.csv")
+readr::write_csv(rob_A, outA_csv)
+
+make_forest(rob_A, "2015", file.path(fig_dir, "forest_SET_A_2015.png"))
+make_forest(rob_A, "2021", file.path(fig_dir, "forest_SET_A_2021.png"))
+
+# ===================== SET B =====================
+files_B <- tibble::tribble(
+  ~fname,                                  ~spec,                 ~reader,
+  "tab_main_twfe.csv",                     "Main spec (TWFE)", "main_twfe",
+  "tab_main_winsor1_twfe.csv",             "Winsor 1%",           "term",
+  "tab_main_winsor2_twfe.csv",             "Winsor 2%",           "term",
+  "tab_unbalanced_twfe.csv",               "Unbalanced panel",    "term",
+  "main_pureprice/tab_main_pureprice.csv", "Pure price sample",   "pureprice"
+)
+
+rob_B <- files_B |>
+  mutate(full = file.path(tab_dir, fname),
+         tbl  = map2(full, spec, ~ read_dispatch(.x, .y, files_B$reader[files_B$spec==.y]))) |>
+  pull(tbl) |> purrr::compact() |> dplyr::bind_rows() |>
+  dplyr::filter(ring %in% c("0–100 m","100–400 m","400–800 m"), year %in% c("2015","2021")) |>
+  mutate(
+    ring = factor(ring, levels = c("0–100 m","100–400 m","400–800 m")),
+    year = factor(year, levels = c("2015","2021")),
+    spec = factor(spec, levels = c("Main spec (TWFE)","Winsor 1%","Winsor 2%",
+                                   "Unbalanced panel","Pure price sample"))
+  )
+
+outB_csv <- file.path(tab_dir, "robustness_SET_B_ringfirst.csv")
+readr::write_csv(rob_B, outB_csv)
+
+make_forest(rob_B, "2015", file.path(fig_dir, "forest_SET_B_2015.png"))
+make_forest(rob_B, "2021", file.path(fig_dir, "forest_SET_B_2021.png"))
+
+message("Done.\nSet A CSV: ", outA_csv,
+        "\nSet B CSV: ", outB_csv,
+        "\nFigures saved to: ", fig_dir)
+```
+
+# table building
+```{r}
+# ===== Build "matrix" tables with % effect and 95% CI =====
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(stringr); library(tidyr); library(purrr)
+})
+
+tab_dir <- "D:/Elizabeth/outputs/tables"
+
+# ---------- Helpers ----------
+pretty_ring <- function(x){
+  x <- tolower(as.character(x))
+  dplyr::case_when(
+    str_detect(x, "walk_0_100|euc_0_100|euclid_0_100|e0_100|0–?100 ?m") ~ "0–100 m",
+    str_detect(x, "walk_100_400|euc_100_400|euclid_100_400|e100_400|100–?400 ?m") ~ "100–400 m",
+    str_detect(x, "walk_400_800|euc_400_800|euclid_400_800|e400_800|400–?800 ?m") ~ "400–800 m",
+    TRUE ~ NA_character_
+  )
+}
+parse_year_from_term <- function(term){
+  y <- stringr::str_extract(as.character(term), "(2015|2021)")
+  ifelse(is.na(y), NA_character_, y)
+}
+fmt_pct_ci <- function(beta, lo, hi, digits = 1){
+  est <- (exp(beta) - 1) * 100
+  lci <- (exp(lo)    - 1) * 100
+  uci <- (exp(hi)    - 1) * 100
+  sprintf(paste0("%.", digits, "f%% [%.", digits, "f, %.", digits, "f]"), est, lci, uci)
+}
+
+# ---------- Readers ----------
+read_term_tbl <- function(path){
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  term <- df[[ dplyr::coalesce(names(df)[nm=="term"], names(df)[1]) ]]
+  beta <- df[[ dplyr::coalesce(names(df)[nm %in% c("beta","estimate")]) ]]
+  se   <- df[[ dplyr::coalesce(names(df)[nm %in% c("se","std.error")]) ]]
+  p    <- df[[ dplyr::coalesce(names(df)[nm %in% c("p","p.value")]) ]]
+  lo   <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_lo","ci.low","conf.low")]) ]]
+  hi   <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_hi","ci.high","conf.high")]) ]]
+
+  tibble(
+    term = as.character(term),
+    ring = pretty_ring(term),
+    year = parse_year_from_term(term),
+    beta = as.numeric(beta),
+    se   = as.numeric(se),
+    p    = as.numeric(p),
+    ci_lo= suppressWarnings(as.numeric(lo)),
+    ci_hi= suppressWarnings(as.numeric(hi))
+  ) |>
+    mutate(
+      ci_lo = dplyr::coalesce(ci_lo, beta - 1.96*se),
+      ci_hi = dplyr::coalesce(ci_hi, beta + 1.96*se)
+    ) |>
+    filter(!is.na(ring), year %in% c("2015","2021"))
+}
+
+read_fe_tbl <- function(path){
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  ring_raw <- df[[ dplyr::coalesce(names(df)[nm=="ring"], names(df)[1]) ]]
+  year     <- df[[ dplyr::coalesce(names(df)[nm=="year"]) ]]
+  beta     <- df[[ dplyr::coalesce(names(df)[nm %in% c("beta","estimate")]) ]]
+  se       <- df[[ dplyr::coalesce(names(df)[nm %in% c("se","std.error")]) ]]
+  lo       <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_lo","ci.low","conf.low")]) ]]
+  hi       <- df[[ dplyr::coalesce(names(df)[nm %in% c("ci_hi","ci.high","conf.high")]) ]]
+  tibble(
+    ring = pretty_ring(ring_raw),
+    year = as.character(year),
+    beta = as.numeric(beta),
+    se   = as.numeric(se),
+    ci_lo= suppressWarnings(as.numeric(lo)),
+    ci_hi= suppressWarnings(as.numeric(hi))
+  ) |>
+    mutate(
+      ci_lo = dplyr::coalesce(ci_lo, beta - 1.96*se),
+      ci_hi = dplyr::coalesce(ci_hi, beta + 1.96*se)
+    ) |>
+    filter(!is.na(ring), year %in% c("2015","2021"))
+}
+
+read_main_twfe <- function(path){
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  df |>
+    transmute(
+      ring = pretty_ring(ring),
+      year = as.character(year),
+      beta = as.numeric(beta),
+      se   = as.numeric(se),
+      ci_lo= as.numeric(dplyr::coalesce(ci_low, beta - 1.96*se)),
+      ci_hi= as.numeric(dplyr::coalesce(ci_high, beta + 1.96*se))
+    ) |>
+    filter(!is.na(ring), year %in% c("2015","2021"))
+}
+
+read_conley <- function(path){
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  stopifnot(all(c("term","beta","se_c","p_c") %in% names(df)))
+  tibble(
+    term = as.character(df$term),
+    ring = pretty_ring(df$term),
+    year = parse_year_from_term(df$term),
+    beta = as.numeric(df$beta),
+    se   = as.numeric(df$se_c),
+    ci_lo= as.numeric(df$beta) - 1.96*as.numeric(df$se_c),
+    ci_hi= as.numeric(df$beta) + 1.96*as.numeric(df$se_c)
+  ) |>
+    filter(!is.na(ring), year %in% c("2015","2021"))
+}
+
+read_pureprice <- function(path){
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  tibble(
+    ring = pretty_ring(df[[ dplyr::coalesce(names(df)[nm=="ring"]) ]]),
+    year = as.character(df[[ dplyr::coalesce(names(df)[nm=="year"]) ]]),
+    beta = as.numeric(df[[ dplyr::coalesce(names(df)[nm %in% c("coef","beta","estimate")]) ]]),
+    se   = as.numeric(df[[ dplyr::coalesce(names(df)[nm %in% c("se","std.error")]) ]])
+  ) |>
+    mutate(ci_lo = beta - 1.96*se, ci_hi = beta + 1.96*se) |>
+    filter(!is.na(ring), year %in% c("2015","2021"))
+}
+
+# 将“长表”转换为矩阵式（行=环带×年份；列=规格；值= %效应[CI]）
+to_matrix_table <- function(long_df, col_order, digits = 1){
+  long_df |>
+    mutate(
+      disp = fmt_pct_ci(beta, ci_lo, ci_hi, digits = digits),
+      ring = factor(ring, levels = c("0–100 m","100–400 m","400–800 m")),
+      year = factor(year, levels = c("2015","2021"))
+    ) |>
+    arrange(ring, year) |>
+    mutate(row_stub = paste0(as.character(ring), " — ", as.character(year))) |>
+    select(row_stub, spec, disp) |>
+    tidyr::pivot_wider(names_from = spec, values_from = disp) |>
+    # 用 select(any_of()) 按指定列顺序重排（无花括号、兼容 |>）
+    dplyr::select(row_stub, dplyr::any_of(col_order)) |>
+    dplyr::rename(`Ring × Year` = row_stub)
+}
+
+
+# ---------- DESIGN ROBUSTNESS ----------
+# 列顺序（你要的列名）
+design_cols <- c("Main","Euclid","Donut","Borough×Year FE","1km Grid×Year FE","Conley 2km")
+
+design_list <- list(
+  Main  = read_main_twfe(file.path(tab_dir, "tab_main_twfe.csv")),
+  Euclid= read_term_tbl (file.path(tab_dir, "tab_euclid_twfe.csv")),
+  Donut = read_term_tbl (file.path(tab_dir, "tab_donut_twfe.csv")),
+  `Borough×Year FE` = read_fe_tbl(file.path(tab_dir, "tab_main_boro_year.csv")),
+  `1km Grid×Year FE`= read_fe_tbl(file.path(tab_dir, "tab_main_grid1k_year.csv")),
+  `Conley 2km`      = read_conley (file.path(tab_dir, "se_compare_conley2km.csv"))
+)
+
+design_long <- imap_dfr(design_list, ~ mutate(.x, spec = .y))
+design_tab  <- to_matrix_table(design_long, col_order = design_cols, digits = 1)
+
+# 写 Excel 友好 CSV（UTF-8 BOM）
+write_excel_csv(design_tab, file.path(tab_dir, "table_design_robustness.csv"))
+
+# ---------- SENSITIVITY ----------
+sens_cols <- c("Main","Winsor 1%","Winsor 2%","Unbalanced","Pure price")
+
+sens_list <- list(
+  Main        = read_main_twfe(file.path(tab_dir, "tab_main_twfe.csv")),
+  `Winsor 1%` = read_term_tbl (file.path(tab_dir, "tab_main_winsor1_twfe.csv")),
+  `Winsor 2%` = read_term_tbl (file.path(tab_dir, "tab_main_winsor2_twfe.csv")),
+  Unbalanced  = read_term_tbl (file.path(tab_dir, "tab_unbalanced_twfe.csv")),
+  `Pure price`= read_pureprice(file.path(tab_dir, "main_pureprice", "tab_main_pureprice.csv"))
+)
+
+sens_long <- imap_dfr(sens_list, ~ mutate(.x, spec = .y))
+sens_tab  <- to_matrix_table(sens_long, col_order = sens_cols, digits = 1)
+
+write_excel_csv(sens_tab, file.path(tab_dir, "table_sensitivity_robustness.csv"))
+
+message("Saved:",
+        "\n - ", file.path(tab_dir, "table_design_robustness.csv"),
+        "\n - ", file.path(tab_dir, "table_sensitivity_robustness.csv"))
+
+```
+#atten
+```{r}
+# ===== YoY Attenuation (2021 vs 2015), ordered by your spec order =====
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(stringr); library(tidyr); library(purrr); library(ggplot2)
+})
+
+tab_dir <- "D:/Elizabeth/outputs/tables"
+fig_dir <- "D:/Elizabeth/outputs/figures"
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+# ---------- helpers ----------
+pretty_ring <- function(x){
+  x <- tolower(as.character(x))
+  dplyr::case_when(
+    str_detect(x, "walk_0_100|euc_0_100|euclid_0_100|e0_100|0–?100 ?m") ~ "0–100 m",
+    str_detect(x, "walk_100_400|euc_100_400|euclid_100_400|e100_400|100–?400 ?m") ~ "100–400 m",
+    str_detect(x, "walk_400_800|euc_400_800|euclid_400_800|e400_800|400–?800 ?m") ~ "400–800 m",
+    TRUE ~ NA_character_
+  )
+}
+parse_year_from_term <- function(term){
+  y <- stringr::str_extract(as.character(term), "(2015|2021)")
+  ifelse(is.na(y), NA_character_, y)
+}
+safe_read <- function(expr) tryCatch(expr, error = function(e) NULL)
+
+# ---------- readers: keep only ring / year / beta ----------
+read_term_tbl <- function(path){
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  term <- df[[ dplyr::coalesce(names(df)[nm=="term"], names(df)[1]) ]]
+  beta <- df[[ dplyr::coalesce(names(df)[nm %in% c("beta","estimate")]) ]]
+  tibble(ring = pretty_ring(term),
+         year = parse_year_from_term(term),
+         beta = as.numeric(beta)) |>
+    filter(!is.na(ring), year %in% c("2015","2021"))
+}
+read_fe_tbl <- function(path){
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  tibble(
+    ring = pretty_ring(df[[ dplyr::coalesce(names(df)[nm=="ring"], names(df)[1]) ]]),
+    year = as.character(df[[ dplyr::coalesce(names(df)[nm=="year"]) ]]),
+    beta = as.numeric(df[[ dplyr::coalesce(names(df)[nm %in% c("beta","estimate")]) ]])
+  ) |> filter(!is.na(ring), year %in% c("2015","2021"))
+}
+read_main_twfe <- function(path){
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  tibble(
+    ring = pretty_ring(df$ring),
+    year = as.character(df$year),
+    beta = as.numeric(df$beta)
+  ) |> filter(!is.na(ring), year %in% c("2015","2021"))
+}
+read_conley <- function(path){
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  if (!all(c("term","beta") %in% names(df))) return(NULL)
+  tibble(
+    ring = pretty_ring(df$term),
+    year = parse_year_from_term(df$term),
+    beta = as.numeric(df$beta)
+  ) |> filter(!is.na(ring), year %in% c("2015","2021"))
+}
+read_pureprice <- function(path){
+  df <- suppressMessages(read_csv(path, show_col_types = FALSE))
+  nm <- tolower(names(df))
+  tibble(
+    ring = pretty_ring(df[[ dplyr::coalesce(names(df)[nm=="ring"]) ]]),
+    year = as.character(df[[ dplyr::coalesce(names(df)[nm=="year"]) ]]),
+    beta = as.numeric(df[[ dplyr::coalesce(names(df)[nm %in% c("coef","beta","estimate")]) ]])
+  ) |> filter(!is.na(ring), year %in% c("2015","2021"))
+}
+
+# ---------- build long tables with YOUR spec labels ----------
+get_design_long <- function(){
+  lst <- list(
+    "Main spec (Table 3)" = safe_read(read_main_twfe(file.path(tab_dir, "tab_main_twfe.csv"))),
+    "Euclidean rings (TWFE)" = safe_read(read_term_tbl (file.path(tab_dir, "tab_euclid_twfe.csv"))),
+    "Donut rings (TWFE)"     = safe_read(read_term_tbl (file.path(tab_dir, "tab_donut_twfe.csv"))),
+    "Borough×Year FE"        = safe_read(read_fe_tbl(file.path(tab_dir, "tab_main_boro_year.csv"))),
+    "1km Grid×Year FE"       = safe_read(read_fe_tbl(file.path(tab_dir, "tab_main_grid1k_year.csv"))),
+    "Conley 2km (TWFE)"      = safe_read(read_conley (file.path(tab_dir, "se_compare_conley2km.csv")))
+  )
+  lst |> purrr::compact() |> dplyr::bind_rows(.id = "spec")
+}
+get_sensitivity_long <- function(){
+  lst <- list(
+    "Main spec (Table 3)" = safe_read(read_main_twfe(file.path(tab_dir, "tab_main_twfe.csv"))),
+    "Winsor 1%"           = safe_read(read_term_tbl (file.path(tab_dir, "tab_main_winsor1_twfe.csv"))),
+    "Winsor 2%"           = safe_read(read_term_tbl (file.path(tab_dir, "tab_main_winsor2_twfe.csv"))),
+    "Unbalanced panel"    = safe_read(read_term_tbl (file.path(tab_dir, "tab_unbalanced_twfe.csv"))),
+    "Pure price sample"   = safe_read(read_pureprice(file.path(tab_dir, "main_pureprice", "tab_main_pureprice.csv")))
+  )
+  lst |> purrr::compact() |> dplyr::bind_rows(.id = "spec")
+}
+
+# ---------- YoY attenuation: 1 - exp(beta_2021 - beta_2015) ----------
+compute_yoy_att <- function(long_df, spec_levels){
+  long_df |>
+    filter(ring %in% c("0–100 m","100–400 m","400–800 m"),
+           year %in% c("2015","2021")) |>
+    mutate(
+      ring = factor(ring, levels = c("0–100 m","100–400 m","400–800 m")),
+      spec = factor(spec, levels = spec_levels)
+    ) |>
+    select(spec, ring, year, beta) |>
+    tidyr::pivot_wider(names_from = year, values_from = beta) |>
+    mutate(
+      beta_2015 = `2015`, beta_2021 = `2021`,
+      atten     = ifelse(is.na(beta_2015) | is.na(beta_2021), NA_real_,
+                         1 - exp(beta_2021 - beta_2015)),
+      atten_pct = 100 * atten
+    ) |>
+    select(spec, ring, beta_2015, beta_2021, atten, atten_pct) |>
+    arrange(spec, ring)
+}
+
+# ---------- Plot bars (single YoY attenuation) ----------
+plot_yoy_bars <- function(att_df, title, out_png){
+  att_df <- att_df |>
+    mutate(
+      spec = factor(spec, levels = levels(att_df$spec)),
+      ring = factor(ring, levels = c("0–100 m","100–400 m","400–800 m"))
+    )
+  g <- ggplot(att_df, aes(x = spec, y = atten_pct, fill = ring)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(x = NULL, y = "Attenuation 2021 vs 2015 (%)",
+         title = title,
+         subtitle = "atten = 100 × [1 − exp(β_2021 − β_2015)]") +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "top")
+  ggsave(out_png, g, width = 9, height = 4.8, dpi = 300)
+}
+
+# ================= RUN =================
+design_levels <- c("Main spec (Table 3)","Euclidean rings (TWFE)","Donut rings (TWFE)",
+                   "Borough×Year FE","1km Grid×Year FE","Conley 2km (TWFE)")
+sens_levels   <- c("Main spec (Table 3)","Winsor 1%","Winsor 2%","Unbalanced panel","Pure price sample")
+
+design_long <- get_design_long()
+sens_long   <- get_sensitivity_long()
+
+att_design <- compute_yoy_att(design_long, spec_levels = design_levels)
+att_sens   <- compute_yoy_att(sens_long,   spec_levels = sens_levels)
+
+# —— 各导出一张（包含全部规格与三环带；Excel 友好）——
+readr::write_excel_csv(att_design, file.path(tab_dir, "yoy_attenuation_design.csv"))
+readr::write_excel_csv(att_sens,   file.path(tab_dir, "yoy_attenuation_sensitivity.csv"))
+
+# —— 柱状图（单一“2021 vs 2015”折损率，不分年）——
+plot_yoy_bars(att_design, "obustness: Attenuation (2021 vs 2015)",
+              file.path(fig_dir, "bar_yoy_attenuation_design.png"))
+plot_yoy_bars(att_sens,   "Sensitivity: Attenuation (2021 vs 2015)",
+              file.path(fig_dir, "bar_yoy_attenuation_sensitivity.png"))
+
+message("Saved tables:\n - ", file.path(tab_dir, "yoy_attenuation_design.csv"),
+        "\n - ", file.path(tab_dir, "yoy_attenuation_sensitivity.csv"),
+        "\nFigures saved to: ", fig_dir)
+
+```
+
+#caz/towncenter
+```{r}
+# ==== Packages ====
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(tidyr)
+  library(ggplot2); library(forcats); library(stringr)
+})
+
+# ==== Paths (自动优先用本地/mnt/data；若在Windows请改成你的绝对路径) ====
+p_caz  <- if (file.exists("/mnt/data/tab_hetero_caz.csv")) "/mnt/data/tab_hetero_caz.csv" else "D:/Elizabeth/outputs/tables/tab_hetero_caz.csv"
+p_tc   <- if (file.exists("/mnt/data/tab_hetero_towncentre.csv")) "/mnt/data/tab_hetero_towncentre.csv" else "D:/Elizabeth/outputs/tables/tab_hetero_towncentre.csv"
+
+out_dir <- "outputs/figs"; if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# ==== Helper：整形 + 画图函数 ====
+prep_df <- function(df, context_label){
+  ring_lv <- c("walk_0_100","walk_100_400","walk_400_800")
+  ring_lb <- c("0–100 m","100–400 m","400–800 m")
+  df %>%
+    mutate(
+      context = context_label,
+      ring    = factor(ring, levels = ring_lv, labels = ring_lb),
+      term    = factor(term, levels = c("Inside","Outside","Inside-Outside"))
+    )
+}
+
+forest_plot <- function(df_ctx, context_label){
+  dfp <- df_ctx %>% filter(term %in% c("Inside","Outside","Inside-Outside"))
+  ggplot(dfp, aes(x = pct, y = fct_rev(fct_inorder(str_c(ring, " • ", term))))) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_errorbarh(aes(xmin = pct_lo, xmax = pct_hi), height = 0.18, linewidth = 0.5) +
+    geom_point(size = 2) +
+    facet_wrap(~ year, ncol = 1, scales = "free_y") +
+    labs(x = "% effect vs >800 m", y = NULL,
+         title = paste0(context_label, ": Forest plot of near-station effects"),
+         caption = "Points are 100*(exp(beta)-1); bars are 95% CIs.") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+}
+
+attenuation_df <- function(df_ctx){
+  # 折损率：Atten_k = 1 - exp(beta_2021)/exp(beta_2015) = 1 - exp(beta_2021 - beta_2015)
+  df_ctx %>%
+    select(year, ring, term, beta) %>%
+    pivot_wider(names_from = year, values_from = beta, names_prefix = "beta_") %>%
+    mutate(att_frac = 1 - exp(beta_2021 - beta_2015),
+           att_pct  = 100 * att_frac)
+}
+
+att_bars_inside_outside <- function(att_ctx, context_label){
+  ggplot(att_ctx %>% filter(term %in% c("Inside","Outside")),
+         aes(x = ring, y = att_pct, fill = term)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+    geom_text(aes(label = sprintf("%.1f", att_pct)),
+              position = position_dodge(width = 0.7), vjust = -0.4, size = 3) +
+    labs(x = NULL, y = "Attenuation from 2015 to 2021 (%)",
+         title = paste0(context_label, ": Attenuation of Inside/Outside"),
+         caption = "Attenuation = 100 * [1 - exp(beta_2021)/exp(beta_2015)].") +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "top")
+}
+
+att_bars_contrast <- function(att_ctx, context_label){
+  ggplot(att_ctx %>% filter(term == "Inside-Outside"),
+         aes(x = ring, y = att_pct)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_col(width = 0.6) +
+    geom_text(aes(label = sprintf("%.1f", att_pct)), vjust = -0.4, size = 3) +
+    labs(x = NULL, y = "Attenuation of Inside–Outside (%)",
+         title = paste0(context_label, ": Attenuation of Inside–Outside contrast"),
+         caption = "Attenuation = 100 * [1 - exp(beta_2021)/exp(beta_2015)].") +
+    theme_minimal(base_size = 12)
+}
+
+# ==== 读取与处理 ====
+df_caz <- read_csv(p_caz, show_col_types = FALSE)  |> prep_df("CAZ")
+df_tc  <- read_csv(p_tc,  show_col_types = FALSE)  |> prep_df("Town Centre")
+
+# ==== 森林图 ====
+p_forest_caz <- forest_plot(df_caz, "CAZ")
+p_forest_tc  <- forest_plot(df_tc,  "Town Centre")
+
+ggsave(file.path(out_dir, "forest_caz.png"), p_forest_caz, width = 7, height = 7, dpi = 300)
+ggsave(file.path(out_dir, "forest_towncentre.png"), p_forest_tc, width = 7, height = 7, dpi = 300)
+
+# ==== 折损率计算 + 柱状图 ====
+att_caz <- attenuation_df(df_caz)
+att_tc  <- attenuation_df(df_tc)
+
+p_att_io_caz <- att_bars_inside_outside(att_caz, "CAZ")
+p_att_io_tc  <- att_bars_inside_outside(att_tc,  "Town Centre")
+p_att_con_caz <- att_bars_contrast(att_caz, "CAZ")
+p_att_con_tc  <- att_bars_contrast(att_tc,  "Town Centre")
+
+ggsave(file.path(out_dir, "attenuation_inside_outside_caz.png"), p_att_io_caz, width = 7, height = 4.2, dpi = 300)
+ggsave(file.path(out_dir, "attenuation_inside_outside_towncentre.png"), p_att_io_tc, width = 7, height = 4.2, dpi = 300)
+ggsave(file.path(out_dir, "attenuation_contrast_caz.png"), p_att_con_caz, width = 6.5, height = 4, dpi = 300)
+ggsave(file.path(out_dir, "attenuation_contrast_towncentre.png"), p_att_con_tc, width = 6.5, height = 4, dpi = 300)
+
+message("Done. Saved figures to: ", normalizePath(out_dir))
+
+
+```
+#scat distribution
+```{r}
+# ==== Packages ====
+suppressPackageStartupMessages({
+  library(sf); library(arrow); library(dplyr); library(tidyr)
+  library(ggplot2); library(stringr); library(fs)
+})
+
+# ==== Paths ====
+p_boro <- "D:/Elizabeth/data/interim/gla_boroughs_2024_27700.gpkg"
+p_parq <- "D:/Elizabeth/data/clean/borough_final/voa_panel_with_station_band_balanced_with_switch_boroughfinal_with_walkbands.parquet"
+out_dir <- "outputs/figs"; dir_create(out_dir)
+out_png <- file.path(out_dir, "map_industry_distribution_2008_2015_2021.png")
+
+# ==== 1) 读底图 ====
+boros <- st_read(p_boro, quiet = TRUE) |> st_make_valid() |> st_transform(27700)
+
+# ==== 2) 读平衡样本 & 取三年 ====
+df <- arrow::read_parquet(p_parq) |> as.data.frame() |>
+  filter(balanced_3 == 1, avd %in% c(2008L, 2015L, 2021L)) |>
+  mutate(
+    grp = case_when(
+      as.character(scat_grp) %in% c("097","97") ~ "Food Supermarkets",
+      as.character(scat_grp) %in% c("098","98") ~ "Hypermarkets",
+      TRUE ~ as.character(scat_grp)
+    )
+  )
+
+# ==== 3) 尝试构造 sf 点图层（优先使用 geometry 列；否则用坐标列）====
+to_points_sf <- function(d){
+  if ("geometry" %in% names(d)) {
+    # 尝试 WKB/WKT 自动识别
+    if (inherits(d$geometry, "list") || inherits(d$geometry, "blob")) {
+      # WKB
+      sfc <- sf::st_as_sfc(d$geometry, EWKB = TRUE)
+      sf::st_sf(d |> select(-geometry), geometry = sfc, crs = 27700)
+    } else if (is.character(d$geometry)) {
+      # WKT
+      sfc <- sf::st_as_sfc(d$geometry, crs = 27700)
+      sf::st_sf(d |> select(-geometry), geometry = sfc)
+    } else if (inherits(d$geometry, "sfc")) {
+      st_as_sf(d) |> st_set_crs(27700)
+    } else {
+      stop("Unrecognized 'geometry' column format.")
+    }
+  } else {
+    # 尝试常见坐标列
+    coord_sets <- list(
+      c("x","y"), c("easting","northing"),
+      c("X","Y"), c("lon","lat"), c("longitude","latitude")
+    )
+    found <- NULL
+    for (cs in coord_sets) if (all(cs %in% names(d))) { found <- cs; break }
+    if (is.null(found)) stop("No geometry or recognizable coordinate columns found.")
+    pts <- sf::st_as_sf(d, coords = found, crs = ifelse(found[1] %in% c("lon","longitude"), 4326, 27700))
+    if (sf::st_crs(pts)$epsg != 27700) pts <- st_transform(pts, 27700)
+    pts
+  }
+}
+
+pts <- to_points_sf(df)
+
+# ==== 4) 仅选可视化需要的列，限制业态数量避免花屏 ====
+# 统计业态总体规模，取 Top 5（可改 top_k）
+top_k <- 5
+top_grps <- pts |> st_drop_geometry() |>
+  count(grp, name = "n") |> arrange(desc(n)) |> slice_head(n = top_k) |> pull(grp)
+
+pts <- pts |>
+  mutate(grp_plot = if_else(grp %in% top_grps, grp, "Other"),
+         avd = factor(avd, levels = c(2008, 2015, 2021)))
+
+# 可选：每年抽样以提升绘图速度（如每年最多 30k 点）
+limit <- 30000
+
+pts_sampled <- pts %>%
+  dplyr::group_split(avd) %>%
+  lapply(function(d) dplyr::slice_sample(d, n = min(nrow(d), limit))) %>%
+  dplyr::bind_rows()
+
+# 后面作图时把 data=pts 改为 data=pts_sampled
+# geom_sf(data = pts_sampled, aes(color = grp_plot), ...)
+
+
+# ==== 5) 绘图（同一张图分三列显示三年；按业态着色）====
+p <- ggplot() +
+  geom_sf(data = boros, fill = NA, color = "grey20", linewidth = 0.5) +
+  geom_sf(data = pts, aes(color = grp_plot), alpha = 0.35, size = 0.05, show.legend = TRUE) +
+  facet_wrap(~ avd, nrow = 1) +
+  coord_sf(crs = 27700) +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  labs(
+    title = "Industry distribution of balanced retail properties near the Elizabeth line",
+    subtitle = "Three assessment years shown side-by-side (EPSG:27700); points colored by industry (Top 5, others grouped)",
+    color = "Industry"
+  ) +
+  theme_void(base_size = 11) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(out_png, p, width = 12, height = 5, dpi = 300)
+message("Saved: ", out_png)
+```
+#statistics
+```{r}
+# ==== Packages ====
+suppressPackageStartupMessages({
+  library(arrow); library(dplyr); library(tidyr); library(readr); library(stringr); library(fs)
+})
+
+# ==== Paths ====
+p_in <- "D:/Elizabeth/data/clean/borough_final/voa_panel_with_station_band_balanced_with_switch_boroughfinal_with_walkbands.parquet"
+out_dir <- "outputs/diagnostics"; fs::dir_create(out_dir)
+out_csv <- file.path(out_dir, "yr_ring_group_counts_balanced.csv")
+
+# ==== Params ====
+rings   <- c("walk_0_100","walk_100_400","walk_400_800")
+lab_ring <- c(walk_0_100="0–100 m", walk_100_400="100–400 m", walk_400_800="400–800 m")
+
+# ==== 1) 读数据（平衡样本；若用全样本，去掉 filter(balanced_3==1)）====
+df <- read_parquet(p_in) |> as.data.frame() |>
+  filter(balanced_3 == 1, avd %in% c(2008L, 2015L, 2021L)) |>
+  mutate(
+    across(all_of(rings), ~ as.integer(. > 0)),
+    grp = case_when(
+      as.character(scat_grp) %in% c("097","97") ~ "Food Supermarkets",
+      as.character(scat_grp) %in% c("098","98") ~ "Hypermarkets",
+      TRUE ~ as.character(scat_grp)
+    )
+  )
+
+# ==== 2) year×ring×业态 计数（仅 0–800m 环带）====
+counts <- df |>
+  tidyr::pivot_longer(all_of(rings), names_to="ring_var", values_to="in_ring") |>
+  filter(in_ring == 1L) |>
+  mutate(ring = unname(lab_ring[ring_var])) |>
+  count(avd, ring, grp, name = "n") |>
+  tidyr::complete(avd, ring, grp, fill = list(n = 0)) |>
+  arrange(avd, ring, desc(n))
+
+# 可选：同时给出“在每个 year×ring 内的占比”
+counts <- counts |>
+  group_by(avd, ring) |>
+  mutate(share = n / sum(n)) |>
+  ungroup()
+
+# ==== 3) 导出与预览 ====
+write_csv(counts, out_csv)
+print(head(counts, 20))
+message("写出：", out_csv)
+```

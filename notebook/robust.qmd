@@ -1,0 +1,144 @@
+---
+title: "robust"
+format: html
+editor: visual
+---
+
+```{r}
+#| label: donut-euclid-setup
+library(fixest)
+library(dplyr)
+library(readr)
+library(stringr)
+library(here)
+
+dir.create(here("outputs/tables"), recursive = TRUE, showWarnings = FALSE)
+
+# 业态×年 FE（若尚未构造）
+if (!"scat_year" %in% names(df)) {
+  df <- df %>% mutate(scat_year = interaction(scat3, avd, drop = TRUE))
+}
+
+# 保证环带为逻辑；补齐欧氏环带（若缺）
+as_logi <- function(x) as.logical(as.integer(x))
+df <- df %>%
+  mutate(
+    walk_0_100     = as_logi(walk_0_100),
+    walk_100_400   = as_logi(walk_100_400),
+    walk_400_800   = as_logi(walk_400_800),
+    walk_beyond_800= as_logi(walk_beyond_800),
+    euc_0_100      = if ("in_station_0_100"   %in% names(df)) as_logi(in_station_0_100)   else dist_to_sta_m <= 100,
+    euc_100_400    = if ("in_station_100_400" %in% names(df)) as_logi(in_station_100_400) else dist_to_sta_m > 100 & dist_to_sta_m <= 400,
+    euc_400_800    = if ("in_station_400_800" %in% names(df)) as_logi(in_station_400_800) else dist_to_sta_m > 400 & dist_to_sta_m <= 800
+  )
+
+# 便捷拟合器（borough 聚类 SE）
+fit_twfe <- function(data, rings){
+  rhs <- paste0("i(avd, c(2015, 2021)) : (", paste(rings, collapse = " + "), ")")
+  fml <- as.formula(paste("ln_rv ~", rhs, "| uarn + avd + scat_year"))
+  feols(fml, data = data, cluster = ~ borough_final)
+}
+
+# 美化字典（列名翻译成期刊样式）
+dict_labels <- c(
+  "avd::2015:walk_0_100"   = "2015 × 0–100 m",
+  "avd::2015:walk_100_400" = "2015 × 100–400 m",
+  "avd::2015:walk_400_800" = "2015 × 400–800 m",
+  "avd::2021:walk_0_100"   = "2021 × 0–100 m",
+  "avd::2021:walk_100_400" = "2021 × 100–400 m",
+  "avd::2021:walk_400_800" = "2021 × 400–800 m",
+  "avd::2015:euc_0_100"    = "2015 × 0–100 m (Euclid)",
+  "avd::2015:euc_100_400"  = "2015 × 100–400 m (Euclid)",
+  "avd::2015:euc_400_800"  = "2015 × 400–800 m (Euclid)",
+  "avd::2021:euc_0_100"    = "2021 × 0–100 m (Euclid)",
+  "avd::2021:euc_100_400"  = "2021 × 100–400 m (Euclid)",
+  "avd::2021:euc_400_800"  = "2021 × 400–800 m (Euclid)"
+)
+
+# CSV 辅助：抽取系数+SE并计算百分比效应与95%CI
+extract_csv <- function(mod, keep_regex, pretty_map = dict_labels, file){
+  ct <- fixest::coeftable(mod)
+  rn <- rownames(ct)
+  sel <- str_detect(rn, keep_regex)
+  if (!any(sel)) stop("No coefficients matched: ", keep_regex)
+  est <- ct[sel, "Estimate"]
+  se  <- ct[sel, "Std. Error"]
+  lo  <- est - 1.96*se
+  hi  <- est + 1.96*se
+  pct <- 100*(exp(est) - 1)
+  pct_lo <- 100*(exp(lo) - 1)
+  pct_hi <- 100*(exp(hi) - 1)
+  out <- tibble(
+    term_raw = rn[sel],
+    term = ifelse(rn[sel] %in% names(pretty_map), pretty_map[rn[sel]], rn[sel]),
+    beta = as.numeric(est),
+    se = as.numeric(se),
+    ci_lo = as.numeric(lo),
+    ci_hi = as.numeric(hi),
+    pct = as.numeric(pct),
+    pct_lo = as.numeric(pct_lo),
+    pct_hi = as.numeric(pct_hi),
+    p = 2*pnorm(-abs(est/se))
+  )
+  write_csv(out, here(file))
+  out
+}
+```
+
+### donut
+```{r}
+#| label: donut-output
+df_donut  <- df %>% filter(!walk_0_100)
+mod_donut <- fit_twfe(df_donut, rings = c("walk_100_400","walk_400_800"))
+
+# LaTeX（仅显示 2015/2021 × {100–400, 400–800}）
+fixest::etable(
+  "Donut: drop 0–100 m (network rings)" = mod_donut,
+  keep = "%^avd::(2015|2021):(walk_100_400|walk_400_800)$",
+  dict = dict_labels,
+  digits = 5,
+  signif.code = c("***"=0.001,"**"=0.01,"*"=0.05,"."=0.10),
+  tex = TRUE,
+  file = here("outputs/tables/tab_donut_twfe.tex")
+)
+
+# CSV（含百分比效应与95%CI）
+extract_csv(
+  mod_donut,
+  keep_regex = "^avd::(2015|2021):(walk_100_400|walk_400_800)$",
+  file = "outputs/tables/tab_donut_twfe.csv"
+)
+```
+
+### euclidean
+```{r}
+#| label: euclid-output
+# 网络环带（主对照）
+mod_net <- fit_twfe(df, rings = c("walk_0_100","walk_100_400","walk_400_800"))
+# 欧氏环带
+mod_euc <- fit_twfe(df, rings = c("euc_0_100","euc_100_400","euc_400_800"))
+
+# LaTeX：并排表
+fixest::etable(
+  "Network rings (walk-bands)" = mod_net,
+  "Euclidean rings"            = mod_euc,
+  keep  = "%^avd::(2015|2021):(walk_0_100|walk_100_400|walk_400_800|euc_0_100|euc_100_400|euc_400_800)$",
+  dict  = dict_labels,
+  digits= 5,
+  signif.code = c("***"=0.001,"**"=0.01,"*"=0.05,"."=0.10),
+  tex   = TRUE,
+  file  = here("outputs/tables/tab_net_vs_euclid_twfe.tex")
+)
+
+# CSV（分开各导一份，便于附录/图表使用）
+extract_csv(
+  mod_net,
+  keep_regex = "^avd::(2015|2021):(walk_0_100|walk_100_400|walk_400_800)$",
+  file = "outputs/tables/tab_network_twfe.csv"
+)
+extract_csv(
+  mod_euc,
+  keep_regex = "^avd::(2015|2021):(euc_0_100|euc_100_400|euc_400_800)$",
+  file = "outputs/tables/tab_euclidean_twfe.csv"
+)
+```n  
