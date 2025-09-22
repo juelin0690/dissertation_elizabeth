@@ -1,0 +1,7 @@
+year,n_uarn,group,n_obs,share_of_n_obs,group_total_uarn,match rate
+2008,78098,balanced,90084,0.867 ,78098,0.762 
+2015,78098,balanced,90217,0.866 ,78098,0.762 
+2021,78098,balanced,89928,0.868 ,78098,0.762 
+2008,79934,unbalanced,90084,0.887 ,89589,0.874 
+2015,89572,unbalanced,90217,0.993 ,89589,0.874 
+2021,87770,unbalanced,89928,0.976 ,89589,0.874 

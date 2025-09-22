@@ -1,0 +1,8 @@
+Ring,0-100 m,100-400 m,400-800 m,
+"MDE (80% power, ¦Á=0.05) 2015 effect (%)",17.2 ,18.3 ,13.3 ,
+"MDE (80% power, ¦Á=0.05) 2021 effect (%)",13.6 ,11.8 ,11.6 ,
+"MDE (80% power, ¦Á=0.05) Attenuation 2015-2021 (pp)",25.9 ,15.7 ,7.9 ,
+Observed 2015 effect (%),6.2 ,4.3 ,5.9 ,
+Observed 2021 effect (%),-3.8 ,0.8 ,1.8 ,
+Observed Attenuation 2015-2021 (pp),10.0 ,3.6 ,4.1 ,
+Detected? (|obs| > MDE) ,No,No,No,

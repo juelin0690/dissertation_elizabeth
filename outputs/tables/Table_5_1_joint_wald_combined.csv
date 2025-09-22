@@ -1,0 +1,13 @@
+Panel A: Joint,,,,,,,
+Hypothesis,Ring,F-stat,p-value,Decision (5%),,Decision (10%),
+Joint H0: ¦Â2015=¦Â2021=0 ,All,1.587,0.146,Not reject,,Not reject,
+Panel B: Within-ring equality,,,,,,,
+Hypothesis,Ring,t-stat,p-value,Decision (5%),,Decision (10%),
+H0: ¦Â2021 = ¦Â2015 ,0-100 m,-1.251 ,0.220 ,Not reject,,Not reject,
+H0: ¦Â2021 = ¦Â2015 ,100-400 m,-0.710 ,0.483 ,Not reject,,Not reject,
+H0: ¦Â2021 = ¦Â2015 ,400-800 m,-1.552 ,0.131 ,Not reject,,Not reject,
+Panel C: Effects & attenuation,,,,,,,
+Hypothesis,Ring,2015 effect (%),2015 CI (%),2021 effect (%),2021 CI (%),Attenuation (pp),Attenuation CI (pp)
+Estimates & attenuation,0-100 m,6.4 ,"[-5.1 , 17.9]",-3.7 ,"[-12.0 , 4.6]",9.5 ,"[-4.7 , 23.6]"
+Estimates & attenuation,100-400 m,4.4 ,"[-7.4 , 16.3]",0.8 ,"[-6.8 , 8.4]",3.5 ,"[-6.0 , 13.0]"
+Estimates & attenuation,400-800 m,6.0 ,"[-3.0 , 15.0]",1.8 ,"[-5.8 , 9.4]",4.0 ,"[-1.0 , 9.0]"
