@@ -2,16 +2,16 @@ Elizabeth Line × Retail RV — Reproducible Workflow
 
 This repository reproduces the dissertation results on pre-opening capitalisation of the Elizabeth line for retail properties. The pipeline is Python + SQL for data preparation and R (Quarto) for modelling and analysis.
 1) Repository structure
-.
-├── data/                # input data (raw and interim); not tracked if restricted
-├── notebook/            # analysis notebooks and Quarto file
-│   ├── 01_data_clean.ipynb（rv,rings,ptal,imd,caz,tc）
-│   ├── 02_descriptive.ipynb/qmd
-│   └── main_model_twfe.qmd
-├── outputs/             # key outputs (tables, figures)
-│   ├── tables/
-│   └── figures/
-└── README.md
+data
+data/                # input data (raw and interim); not tracked if restricted
+notebook/            # analysis notebooks and Quarto file
+01_data_clean.ipynb（rv,rings,ptal,imd,caz,tc）
+02_descriptive.ipynb/qmd
+main_model_twfe.qmd
+outputs/             # key outputs (tables, figures)
+tables/
+figures/
+README.md
 
 Run order by filename:
 01_data_clean.ipynb → 02_descriptive_statistics.ipynb/qmd → 03_main_model_twfe.qmd
